@@ -1,0 +1,15 @@
+# The bundled offline task fixtures. No network, no dataset download — for smoke-testing the
+# whole loop end to end cheaply before pointing it at a real benchmark.
+_target_: flowcode.envs.code_exec.CodeExecEnv
+name: fixtures
+dataset: fixtures
+split: train
+limit: null
+seed: 0
+
+reward_beta: 1.0
+reward_floor: 0.01
+
+timeout_seconds: 5.0
+memory_limit_mb: 512
+workers: 4

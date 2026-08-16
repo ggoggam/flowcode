@@ -1,0 +1,21 @@
+# MBPP: short self-contained Python functions with 3 assert-style tests each. The small test
+# count makes partial credit coarse (0, 1/3, 2/3, 1) but still far better than pass/fail.
+_target_: flowcode.envs.code_exec.CodeExecEnv
+name: mbpp
+dataset: mbpp # mbpp | humaneval | fixtures
+split: train
+limit: 200 # cap the task set; null for all
+seed: 0
+
+# Reward shaping. p(x) ∝ R(x)^beta, so beta sharpens the target distribution: beta=1 samples
+# proportionally to pass rate, large beta collapses toward argmax (and throws away the
+# diversity that motivates GFlowNets in the first place).
+reward_beta: 1.0
+# Floor keeps log R finite for total failures. Without it every broken sample contributes
+# log R = -inf and the objective degenerates.
+reward_floor: 0.01
+
+# Sandbox limits — see flowcode.envs.sandbox for what these do and do not protect against.
+timeout_seconds: 10.0
+memory_limit_mb: 1024
+workers: 8

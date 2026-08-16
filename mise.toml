@@ -1,0 +1,61 @@
+# flowcode project config (a monorepo config_root; registered in the workspace-root mise.toml).
+# uv lives here rather than the root [tools] set for the same reason go lives in hitch/mise.toml
+# and gcloud-cli-lite/mise.toml — project-specific toolchains stay with the project that needs
+# them, so a CI job installs only its own set.
+
+[tools]
+# uv manages the interpreter itself (`.python-version` pins 3.12), so python is deliberately
+# NOT a mise tool here. Two installers owning the same runtime is how you get a venv built
+# against one interpreter and imported by another.
+uv = "latest"
+
+[env]
+# Tinker reads TINKER_API_KEY from the environment. The key lives in the *workspace-root*
+# .env, not this project's, so the same credential serves anything else that needs it — hence
+# the "../" here rather than the bare ".env" that hitch and slidekit use.
+# `_.file` is a no-op when the file is absent, so a fresh clone without a key still loads.
+_.file = "../.env"
+
+[tasks.sync]
+description = "Install the locked dependency set into .venv"
+run = "uv sync --all-extras --group dev"
+
+[tasks.test]
+description = "Run the unit tests (skips network- and Tinker-marked tests)"
+run = "uv run pytest"
+
+[tasks."test:all"]
+description = "Run every test including the network-dependent dataset loaders (no Tinker spend)"
+run = "uv run pytest -m 'not tinker'"
+
+[tasks.lint]
+description = "Lint with ruff and type-check with ty"
+run = ["uv run ruff check .", "uv run ty check src tests"]
+
+[tasks.fmt]
+description = "Format Python code with ruff and apply safe lint fixes"
+run = ["uv run ruff format .", "uv run ruff check --fix ."]
+
+[tasks."fmt:check"]
+description = "Fail if any Python file needs reformatting"
+run = "uv run ruff format --check ."
+
+[tasks.check]
+description = "Full check suite: lint + test"
+depends = ["lint", "test"]
+
+[tasks.train]
+description = "Run a training job. Usage: mise run train -- objective=vargrad env=mbpp"
+run = "uv run flowcode-train"
+
+[tasks.sweep]
+description = "Hydra multirun sweep. Usage: mise run sweep -- objective=tb,subtb,vargrad"
+run = "uv run flowcode-train --multirun"
+
+[tasks.cost]
+description = "Price a config before spending. Usage: mise run cost -- train.steps=1000"
+run = "uv run flowcode-cost"
+
+[tasks."pre-commit"]
+description = "Run pre-commit checks via prek"
+run = "prek run --show-diff-on-failure --color=always --all-files --hook-stage=manual"

@@ -1,0 +1,27 @@
+# Root Hydra config. Compose overrides on the command line:
+#   flowcode-train objective=subtb env=humaneval train.group_size=16
+# Sweep with --multirun:
+#   flowcode-train -m objective=tb,subtb,vargrad
+#
+# Every group below is backed by a structured config (a dataclass registered in
+# flowcode.config), so an override with a typo or a wrong type fails during composition
+# rather than partway into a run that is already spending money.
+defaults:
+  # The structured-config schema, listed explicitly as the base. Hydra can also match a schema
+  # by filename, but that path is deprecated and warns on every run; naming it here is the
+  # supported form and makes the dependency visible.
+  - _root_
+  - model: qwen3-8b
+  - objective: vargrad
+  - env: mbpp
+  - train: default
+  - cost: default
+  - _self_
+
+seed: 0
+
+# Where checkpoints and metric dumps go. Hydra's own run dir (outputs/) holds the composed
+# config and logs; this is for artifacts we want to outlive a sweep.
+output_dir: runs/${now:%Y-%m-%d_%H-%M-%S}
+
+logger: rich # rich | wandb | none

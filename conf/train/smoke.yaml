@@ -1,0 +1,27 @@
+# Minimal end-to-end run: a few dollars at most, enough to prove the loop turns over.
+steps: 5
+groups_per_step: 2
+group_size: 4
+
+temperature: 1.0
+top_p: 1.0
+max_tokens: 256
+
+policy_lr: 1.0e-5
+flow_lr: 1.0e-2
+lr_schedule: constant
+warmup_steps: 0
+grad_clip_norm: 1.0
+
+replay:
+  enabled: false
+  capacity: 100
+  fraction: 0.0
+  prioritize: uniform
+
+on_policy_only: true
+
+sync_sampler_every: 1
+log_every: 1
+eval_every: 0
+checkpoint_every: 0

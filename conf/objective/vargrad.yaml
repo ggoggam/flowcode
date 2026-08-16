@@ -1,0 +1,7 @@
+# VarGrad — the recommended default. Estimates log Z in-batch as the group mean of
+# (log R - sum log P_F), so there is no learned partition function to tune. That removes the
+# single most fiddly hyperparameter in TB training, at the cost of needing group_size > 1.
+_target_: flowcode.objectives.vargrad.VarGrad
+name: vargrad
+reward_temperature: 1.0
+off_policy_correction: false

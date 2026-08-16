@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+*.egg-info/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+mise.local.toml
+.env
+
+# Hydra run directories: it writes the composed config and logs per run/sweep.
+/outputs/
+/multirun/
+# Training artifacts: checkpoint pointers, replay buffers, metric dumps.
+/runs/
+# Scratch directories the code-exec sandbox creates if a run is killed mid-rollout.
+/.sandbox/
+
+.DS_Store

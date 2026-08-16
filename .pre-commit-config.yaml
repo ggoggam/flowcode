@@ -1,0 +1,29 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: '\.bin$'
+      - id: end-of-file-fixer
+        exclude: '\.bin$'
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=500"]
+
+  - repo: local
+    hooks:
+      - id: python-fmt
+        name: python format (ruff)
+        entry: mise run fmt
+        language: system
+        pass_filenames: false
+        types: [python]
+
+      - id: python-lint
+        name: python lint + typecheck (ruff, ty)
+        entry: mise run lint
+        language: system
+        pass_filenames: false
+        types: [python]

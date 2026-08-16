@@ -1,0 +1,12 @@
+# Trajectory Balance (Malkin et al., 2022): (log Z(x) + Σ log P_F - log R(x))².
+# log Z is conditional on the prompt, held in an embedding table over the task set — the model
+# itself is on Tinker and cannot carry an extra head, so the partition function lives client
+# side with its own (much higher) learning rate. See docs/DESIGN.md.
+_target_: flowcode.objectives.tb.TrajectoryBalance
+name: tb
+reward_temperature: 1.0
+off_policy_correction: false
+log_z:
+  _target_: flowcode.objectives.flows.ConditionalLogZ
+  embedding_dim: 1
+  init_value: 0.0

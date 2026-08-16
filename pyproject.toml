@@ -1,0 +1,115 @@
+[project]
+name = "flowcode"
+version = "0.1.0"
+description = "GFlowNet objectives (TB / SubTB / DB / VarGrad) for fine-tuning coding LLMs on Tinker"
+readme = "README.md"
+# 3.12 rather than tinker's own 3.11 floor: one interpreter version, matching .python-version,
+# so the uv-managed venv and the type checker never disagree about which stdlib they are
+# reasoning about. Nothing here needs 3.11 compatibility.
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "ggoggam" }]
+
+dependencies = [
+  # tinker>=0.25 is the first version whose wheel carries forward_backward_custom and the
+  # five-way LossFnType literal; we do not use the former (see docs/DESIGN.md) but we do
+  # rely on forward() returning per-datum `logprobs`, which the same version introduced.
+  "tinker>=0.25.0",
+  # Not an extra of tinker — `tinker[torch]` exists, but every objective in this package is
+  # plain torch autograd, so torch is a hard dependency here regardless.
+  "torch>=2.6",
+  "numpy>=2.1",
+  # Config + CLI. Structured configs (dataclasses in a ConfigStore) rather than bare YAML, so
+  # a typo in an override fails at composition time instead of ten minutes into a paid run.
+  "hydra-core>=1.3",
+  "rich>=13.9",
+]
+
+[project.optional-dependencies]
+# Dataset loaders. Kept optional so the unit tests (which use the bundled JSONL fixtures)
+# install and run without pulling in the HuggingFace stack.
+data = ["datasets>=3.2", "transformers>=4.48"]
+# Experiment tracking.
+wandb = ["wandb>=0.19"]
+
+[project.scripts]
+# One entry point per Hydra app: @hydra.main owns argv, so subcommands under a single binary
+# would fight it for the override syntax.
+flowcode-train = "flowcode.cli.train:main"
+flowcode-cost = "flowcode.cli.cost:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.25",
+  "ruff>=0.9",
+  "ty>=0.0.1a1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/flowcode"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "E",    # pycodestyle
+  "F",    # pyflakes
+  "I",    # isort
+  "UP",   # pyupgrade
+  "B",    # bugbear
+  "SIM",  # flake8-simplify
+  "TID",  # flake8-tidy-imports
+  "ANN",  # flake8-annotations
+  "RUF",
+]
+ignore = [
+  # Explicit `Any` in a signature. Legitimate here: Hydra hands back untyped config nodes, and
+  # the test fakes take **kwargs to satisfy structural protocols.
+  "ANN401",
+]
+
+[tool.ruff.lint.flake8-tidy-imports]
+# Absolute imports only, everywhere. This is the rule that makes `from flowcode.objectives
+# import tb` the single way to reach a module, so moving a file never rewrites its siblings.
+ban-relative-imports = "all"
+
+[tool.ruff.lint.isort]
+known-first-party = ["flowcode"]
+
+# `ty` infers aggressively but, unlike `mypy --strict`, does not *require* annotations — an
+# unannotated function is simply inferred, not rejected. Ruff's ANN ruleset above is what keeps
+# that guarantee, so the pair together covers what mypy --strict used to.
+[tool.ty.environment]
+python-version = "3.12"
+root = ["src", "tests"]
+
+[tool.ty.rules]
+# tinker 0.25.0 ships py.typed, so the SDK is genuinely checked against — that is what caught
+# the `.samples` vs `.sequences` docstring bug. datasets/transformers/wandb/hydra have partial
+# or absent stubs; `ty` reports those as unresolved-import rather than silently inferring Any,
+# so they are downgraded here instead of being globally ignored.
+unresolved-import = "warn"
+
+[tool.hatch.build.targets.wheel.force-include]
+# Ship the Hydra config tree inside the wheel so `flowcode-train` works from an installed
+# package, not only from a source checkout.
+"conf" = "flowcode/conf"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# `network` marks the few tests that hit the HuggingFace hub; `tinker` marks tests that spend
+# real API credits. Neither runs by default — CI and `mise run test` use this deselection.
+markers = [
+  "network: requires internet access",
+  "tinker: calls the live Tinker API and costs money",
+]
+addopts = "-m 'not network and not tinker'"

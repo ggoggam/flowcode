@@ -1,0 +1,14 @@
+# Assumptions the cost estimator uses to price a run before you pay for it. These are only
+# guesses about sequence lengths; `flowcode-cost` also reports what a run ACTUALLY spent, and
+# the two are worth comparing after your first real job.
+prompt_tokens: 300
+completion_tokens: 400
+
+# Within a group, every sample shares one prompt, so all but the first should hit Tinker's
+# prompt cache. Across groups there is no sharing. This is an estimate — SampleResponse
+# reports prompt_cache_hit_tokens, and the training loop records the real figure.
+prompt_cache_hit_rate: 0.8
+
+# Prices are a snapshot of Aug 2026 and WILL drift. Overridable here so a stale table never
+# silently produces a confident wrong number.
+price_overrides: {}

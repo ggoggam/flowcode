@@ -1,0 +1,11 @@
+# Detailed Balance — the adjacent-pair special case of SubTB (equivalently SubTB with λ=0).
+# Densest possible credit assignment, but the most sensitive to a badly fit flow estimator.
+_target_: flowcode.objectives.db.DetailedBalance
+name: db
+granularity: token # token | turn
+reward_temperature: 1.0
+off_policy_correction: false
+flow:
+  _target_: flowcode.objectives.flows.LogFlowEstimator
+  hidden_dim: 64
+  task_embedding_dim: 32

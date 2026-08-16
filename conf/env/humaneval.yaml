@@ -1,0 +1,15 @@
+# HumanEval: 164 hand-written problems with richer test suites than MBPP, so partial credit is
+# finer-grained. Small enough that it is really an eval set — use it to measure, not to train.
+_target_: flowcode.envs.code_exec.CodeExecEnv
+name: humaneval
+dataset: humaneval
+split: test
+limit: null
+seed: 0
+
+reward_beta: 1.0
+reward_floor: 0.01
+
+timeout_seconds: 10.0
+memory_limit_mb: 1024
+workers: 8

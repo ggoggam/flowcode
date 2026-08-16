@@ -1,0 +1,9 @@
+# Cheapest option overall ($0.396/Mtok train). MoE, so more capacity per dollar, but the
+# gpt_oss renderers expose a reasoning channel that needs handling when parsing completions.
+name: openai/gpt-oss-20b
+renderer: gpt_oss_no_sysprompt
+max_context: 32768
+lora_rank: 32
+train_mlp: true
+train_attn: true
+train_unembed: true

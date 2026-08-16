@@ -1,0 +1,19 @@
+# Sub-Trajectory Balance (Madan et al., 2023). Enforces balance on every sub-trajectory
+# between segment boundaries, λ-weighted by length, which gives much denser credit assignment
+# than TB's single terminal constraint.
+#
+# `granularity` selects where states live: `token` puts a boundary at every completion token
+# (the standard LLM-GFlowNet setting, O(T²) pairs); `turn` puts one at each assistant
+# message/tool-call boundary, which matches the agentic framing and keeps the pair count tiny.
+# Both run through the same code path — it is a config flag, not a different implementation.
+_target_: flowcode.objectives.subtb.SubTB
+name: subtb
+lambda_: 0.9
+granularity: token # token | turn
+max_pairs: 4096 # subsample sub-trajectory pairs beyond this to bound cost
+reward_temperature: 1.0
+off_policy_correction: false
+flow:
+  _target_: flowcode.objectives.flows.LogFlowEstimator
+  hidden_dim: 64
+  task_embedding_dim: 32

@@ -1,0 +1,133 @@
+# flowcode
+
+GFlowNet fine-tuning of coding LLMs on the [Tinker](https://tinker-docs.thinkingmachines.ai)
+SDK. Trains a policy to sample solutions *in proportion to* how many tests they pass,
+`p(x) ∝ R(x)`, rather than to maximize the pass rate — the bet being that this finds more
+distinct working solutions per problem than reward-maximizing RL, which converges to one.
+
+Tinker has no trajectory-balance loss and no way to ship one to the server. The whole thing
+rests on a bridge: `cross_entropy` computes `sum(-logprobs * weights)` with arbitrary-signed
+per-token weights, so sending `weights = -dC/dlogprobs` backpropagates *any* client-side
+differentiable loss. See [docs/DESIGN.md](docs/DESIGN.md).
+
+## Status
+
+Objectives are implemented and verified against exactly-computable toy distributions. The
+training loop runs end to end against the code-execution environment. **The hypothesis itself
+is untested** — nothing here has yet compared GFlowNet fine-tuning to a PPO baseline at equal
+spend.
+
+## Objectives
+
+| Objective | Needs a learned flow? | Notes |
+|---|---|---|
+| `vargrad` | no | **Default.** Estimates `log Z` in-batch from the group; no partition function to tune. |
+| `tb` | `log Z(x)` only | Trajectory Balance (Malkin et al. 2022). `log Z` is an embedding table over tasks — exact for a fixed task set. |
+| `subtb` | `log F(s)` | Sub-Trajectory Balance (Madan et al. 2023), λ-weighted. Denser credit assignment; leans on an approximate flow estimator. |
+| `db` | `log F(s)` | Detailed Balance — the adjacent-pair case. Densest, most sensitive to flow-estimator error. |
+
+All four converge to the target distribution on an enumerable toy problem (TV distance
+0.014–0.018, KL 0.005–0.007 against the exact `p(x)`), sampled off-policy with no importance
+correction. `tests/test_convergence.py` is the file that proves the mathematics independently of
+any API call — calibration checks in the same file confirm an argmax-collapsed policy scores
+TV 0.79, so the thresholds are not vacuous.
+
+## Stack
+
+- **[Tinker](https://tinker-docs.thinkingmachines.ai)** — hosted LoRA training and sampling.
+  Default base model `Qwen/Qwen3-8B`: cheapest dense model on the platform that codes well.
+- **torch** — every objective is plain autograd, with no Tinker import anywhere in
+  `objectives/`, so the maths is unit-testable offline at zero API cost.
+- **Hydra + OmegaConf** — structured configs, so a typo in an override fails at composition
+  rather than ten minutes into a paid run. `--multirun` sweeps objectives directly.
+- **uv** — src-layout, absolute imports enforced by ruff (`TID252`).
+
+## Local development
+
+Requires [mise](https://mise.jdx.dev). The Tinker credential is read from the **workspace-root**
+`.env` (`TINKER_API_KEY`), not this directory — see `.env.example`.
+
+```sh
+mise install                 # uv
+mise run sync                # resolve and install into .venv
+mise run test                # unit tests; no network, no API spend
+```
+
+Tasks (monorepo-scoped as `//flowcode:<task>` from the repo root):
+
+| Task | What it does |
+|------|--------------|
+| `mise run //flowcode:sync` | `uv sync --all-extras --group dev` |
+| `mise run //flowcode:test` | pytest, excluding network- and API-marked tests |
+| `mise run //flowcode:test:all` | adds the dataset-loader tests that hit HuggingFace |
+| `mise run //flowcode:lint` | ruff check + `ty` type check |
+| `mise run //flowcode:fmt` | ruff format + safe autofixes |
+| `mise run //flowcode:cost` | price a config before spending anything |
+| `mise run //flowcode:train` | run a training job |
+| `mise run //flowcode:sweep` | Hydra `--multirun` sweep |
+
+## Running
+
+Everything is a Hydra override. Price it first:
+
+```sh
+mise run cost                                    # what the default config would cost
+mise run train -- train=smoke env=fixtures       # ~$0.02, no dataset download, proves the loop turns
+mise run train -- objective=subtb env=mbpp       # a real run
+mise run sweep -- objective=tb,subtb,vargrad,db  # the actual experiment
+```
+
+`flowcode-cost` needs no API key and touches no network — it exists to answer "how much will
+this cost me" before you commit.
+
+## Cost
+
+Measured by the estimator, not guessed. Default config = 8 prompts × 8 samples/step, ~700
+tokens/trajectory, Qwen3-8B at Aug 2026 prices:
+
+| Config | $/step | 1000 steps |
+|---|---|---|
+| defaults (`vargrad`, replay on) | $0.057 | $57 |
+| `train.on_policy_only=true` | $0.037 | $37 |
+| `model=gpt-oss-20b` | $0.049 | $49 |
+| `train=smoke env=fixtures` | $0.005 | $0.02 (5 steps) |
+
+The gap between the first two rows is the gradient bridge: the loop normally makes **two**
+training passes per step — a `forward()` logprob oracle plus the `forward_backward()` gradient
+push — so train tokens are 2×. Strictly on-policy runs skip the oracle and reuse the sampler's
+own logprobs. That is incompatible with replay, and the trainer refuses the combination rather
+than training on stale logprobs.
+
+Prices are a hardcoded Aug 2026 snapshot and will drift; override via `cost.price_overrides`.
+After a real run, `cost.from_usage` reports what was actually spent from observed token counts —
+worth comparing against the estimate, since the model assumes prefix-cache hits are not billed
+at the sampling rate.
+
+## Reward
+
+`log R = β · log(max(pass_fraction, floor))` from running generated code against hidden tests in
+a subprocess sandbox. Tests run individually so partial credit is graded rather than binary —
+this is load-bearing, not a nicety: under all-or-nothing scoring every sample in a group lands
+on the reward floor and VarGrad's group variance, which *is* the learning signal, goes to zero.
+
+Datasets: MBPP and HumanEval via `datasets` (`uv sync --extra data`), plus 30 hand-written
+offline fixtures so the whole test suite runs with no network. HumanEval's single `check()` is
+split per-assertion by AST — otherwise its partial credit would be a fiction.
+
+**The sandbox is a safety net against accidents, not a security boundary.** It stops runaway
+loops, memory and fork bombs, and credential inheritance (a completion printing `os.environ`
+cannot see `TINKER_API_KEY` — there is a test). It does not stop code that deliberately reads
+your filesystem or opens a socket. See [docs/DESIGN.md](docs/DESIGN.md#4-what-the-sandbox-is-and-is-not).
+
+## Not implemented
+
+- **A multi-turn agentic environment.** Trajectories are segmented (`Segment` boundaries are
+  where SubTB's intermediate terms attach) and `granularity: turn` is wired through, but the
+  current environment is single-turn code generation, so turn-level collapses to one segment.
+  A tool-calling environment is the natural next step and the setting where turn-level SubTB
+  should actually earn its keep.
+- **A PPO baseline.** Without one there is no measurement of the diversity claim, which is the
+  entire point.
+- **Flow heads on the model.** Tinker gives no access to hidden states, so `log F` is estimated
+  client-side from coarse features. This is the honest weak point of `subtb` and `db`, and the
+  reason `vargrad` is the default.

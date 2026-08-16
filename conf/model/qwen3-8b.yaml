@@ -1,0 +1,9 @@
+# Cheapest dense chat model on Tinker that codes competently: $0.44/Mtok train, $0.60 sample.
+# Note Llama was retired from Tinker in June 2026 — do not reach for it out of habit.
+name: Qwen/Qwen3-8B
+renderer: qwen3
+max_context: 32768
+lora_rank: 32
+train_mlp: true
+train_attn: true
+train_unembed: true

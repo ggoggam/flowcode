@@ -1,0 +1,10 @@
+# A true base model, no RLHF prior. Arguably the principled choice for GFlowNet reward
+# matching: instruct tuning has already skewed the policy away from the p(x) ∝ R(x) we are
+# trying to learn. Costs ~3x Qwen3-8B and needs few-shot prompting to reliably emit code.
+name: Qwen/Qwen3.5-9B-Base
+renderer: qwen3
+max_context: 65536
+lora_rank: 32
+train_mlp: true
+train_attn: true
+train_unembed: true
