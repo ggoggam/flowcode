@@ -20,6 +20,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 __all__ = [
+    "SampleResponse",
+    "SampledSequence",
+    "SamplingParams",
     "Segment",
     "TokenUsage",
     "Trajectory",
@@ -205,6 +208,94 @@ class TokenUsage:
             num_backward_passes=self.num_backward_passes + other.num_backward_passes,
             num_optim_steps=self.num_optim_steps + other.num_optim_steps,
         )
+
+
+@dataclass(frozen=True)
+class SamplingParams:
+    """How to draw a completion. Backend-neutral by design.
+
+    Every sampler in this package takes one of these rather than its engine's own params
+    object, so :func:`flowcode.rollout.rollout` does not know or care whether it is
+    driving a hosted API or a local engine. Adapting to the engine's own type is the
+    backend's job and happens at its edge.
+
+    Args:
+        max_tokens: Hard cap on generated tokens. A sequence that hits it is reported with
+            ``stop_reason="length"`` and counted as truncated.
+        temperature: Softmax temperature. ``0.0`` means greedy, which the eval path uses.
+        top_p: Nucleus sampling mass. ``1.0`` disables it.
+        stop: Stop conditions, either as strings or as token ids — whichever
+            :func:`flowcode.render.stop_sequences` produced for the renderer. Engines that
+            accept only one form convert at their edge.
+        seed: Sampler seed, or ``None`` to leave it unseeded.
+    """
+
+    max_tokens: int
+    temperature: float = 1.0
+    top_p: float = 1.0
+    stop: Sequence[str] | Sequence[int] = ()
+    seed: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.max_tokens <= 0:
+            raise ValueError(f"max_tokens must be positive, got {self.max_tokens}")
+        if self.temperature < 0.0:
+            raise ValueError(f"temperature must be non-negative, got {self.temperature}")
+        if not 0.0 < self.top_p <= 1.0:
+            raise ValueError(f"top_p must be in (0, 1], got {self.top_p}")
+
+
+@dataclass(frozen=True)
+class SampledSequence:
+    """One completion off a sampler, with the behaviour policy's own logprobs.
+
+    The logprobs are not optional decoration. They become
+    :attr:`Trajectory.sampling_logprobs`, which is what the importance-weighting path in
+    :func:`flowcode.objectives.base.importance_weights` divides by and what
+    ``train.on_policy_only`` substitutes for the oracle forward pass. A sampler that
+    returned tokens without them, and was silently given zeros instead, would be handing
+    the objective a behaviour policy that assigns probability 1 to everything — so the
+    length agreement is enforced here, once, for every backend that builds one.
+
+    Args:
+        tokens: Generated token ids. May be empty: a sampler that returns nothing is a
+            degenerate sample, which :func:`flowcode.rollout.rollout` drops and counts
+            rather than raising on.
+        logprobs: ``log P(token)`` under the sampling policy, one per entry of ``tokens``.
+        stop_reason: Why generation ended. ``"length"`` specifically is counted as a
+            truncation in :class:`~flowcode.rollout.RolloutStats`; anything else is passed
+            through to the trajectory metadata untouched.
+
+    Raises:
+        ValueError: If ``logprobs`` and ``tokens`` disagree in length.
+    """
+
+    tokens: list[int]
+    logprobs: list[float]
+    stop_reason: str = "unknown"
+
+    def __post_init__(self) -> None:
+        if len(self.logprobs) != len(self.tokens):
+            raise ValueError(
+                f"SampledSequence has {len(self.tokens)} tokens but {len(self.logprobs)} "
+                "logprobs; a sampler must return one logprob per sampled token"
+            )
+
+
+@dataclass(frozen=True)
+class SampleResponse:
+    """Every completion drawn for one prompt.
+
+    Args:
+        sequences: The completions, ``num_samples`` of them for a healthy sampler. One
+            response per prompt, so a GFlowNet group is exactly one of these.
+        prompt_cache_hit_tokens: Prompt tokens the engine served from a prefix cache.
+            Reported for throughput accounting and, on billed backends, because they are
+            not charged at the full rate. Samplers without a prefix cache report ``0``.
+    """
+
+    sequences: list[SampledSequence]
+    prompt_cache_hit_tokens: int = 0
 
 
 def token_level_segments(n: int) -> list[Segment]:

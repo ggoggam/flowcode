@@ -28,9 +28,10 @@ from tinker.types import (
     OptimStepResponse,
     SampledSequence,
     SampleResponse,
-    SamplingParams,
 )
+from tinker.types import SamplingParams as TinkerSamplingParams
 
+from flowcode.alignment import observation_length
 from flowcode.config import ModelConfig
 from flowcode.tinker_backend import (
     SamplingClientLike,
@@ -38,12 +39,11 @@ from flowcode.tinker_backend import (
     TrainingClientLike,
     build_datum,
     build_model_input,
-    build_target_tokens,
-    observation_length,
-    pad_completion_values,
-    slice_completion_values,
+    from_tinker_response,
+    from_tinker_sequence,
+    to_tinker_sampling_params,
 )
-from flowcode.types import Segment, TokenUsage, Trajectory
+from flowcode.types import SamplingParams, Segment, TokenUsage, Trajectory
 
 PROMPT = [101, 102, 103, 104]  # P = 4, so ob_len = 3
 COMPLETION = [201, 202, 203, 204, 205]  # N = 5
@@ -157,7 +157,7 @@ class FakeSamplingClient:
         self,
         prompt: ModelInput,
         num_samples: int,
-        sampling_params: SamplingParams,
+        sampling_params: TinkerSamplingParams,
     ) -> SampleResponse:
         self.calls.append((prompt.to_ints(), num_samples))
         sequences = [
@@ -191,35 +191,20 @@ def targets_of(datum: Datum) -> list[int]:
     return [int(x) for x in datum.loss_fn_inputs["target_tokens"].tolist()]
 
 
-# ------------------------------------------------------------------ alignment contract
+# --------------------------------------------------------------- datum construction
+#
+# The alignment arithmetic itself is backend-agnostic and lives in tests/test_alignment.py.
+# What is asserted here is only how a Datum is assembled out of it.
 
 
-class TestAlignmentContract:
-    def test_observation_length_is_prompt_minus_one(self) -> None:
-        assert observation_length(make_trajectory()) == 3
-
+class TestDatumConstruction:
     def test_model_input_is_prompt_plus_completion_minus_last(self) -> None:
-        model_input = build_model_input(make_trajectory())
-        assert model_input.to_ints() == PROMPT + COMPLETION[:-1]
-
-    def test_model_input_length_equals_ob_len_plus_completion(self) -> None:
-        traj = make_trajectory()
-        assert build_model_input(traj).length == observation_length(traj) + len(COMPLETION)
-
-    def test_target_tokens_are_zero_padded_completion(self) -> None:
-        assert build_target_tokens(make_trajectory()) == [0, 0, 0, *COMPLETION]
+        assert build_model_input(make_trajectory()).to_ints() == PROMPT + COMPLETION[:-1]
 
     def test_three_lengths_agree(self) -> None:
         traj = make_trajectory()
         datum = build_datum(traj, [1.0] * len(COMPLETION))
         assert datum.model_input.length == len(targets_of(datum)) == len(weights_of(datum))
-
-    def test_first_completion_token_lands_at_ob_len(self) -> None:
-        # The whole point of the padding: index ob_len of the output scores completion[0].
-        traj = make_trajectory()
-        targets = build_target_tokens(traj)
-        assert targets[observation_length(traj)] == COMPLETION[0]
-        assert targets[-1] == COMPLETION[-1]
 
     def test_oracle_pass_uses_all_zero_weights(self) -> None:
         # Mirrors _get_custom_loss_forward_data: zero weights make the loss identically 0
@@ -231,13 +216,7 @@ class TestAlignmentContract:
         datum = build_datum(make_trajectory(), [1.0, 2.0, 3.0, 4.0, 5.0])
         assert weights_of(datum) == [0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
 
-    def test_prompt_positions_are_always_inert(self) -> None:
-        datum = build_datum(make_trajectory(), [9.0] * 5)
-        ob_len = observation_length(make_trajectory())
-        assert weights_of(datum)[:ob_len] == [0.0] * ob_len
-
     def test_single_token_completion(self) -> None:
-        # completion[:-1] is empty, so the model input is exactly the prompt.
         traj = make_trajectory(prompt=[7, 8, 9], completion=[42])
         datum = build_datum(traj, [1.0])
         assert datum.model_input.to_ints() == [7, 8, 9]
@@ -251,23 +230,9 @@ class TestAlignmentContract:
         assert targets_of(datum) == [0, 42, 43]
         assert weights_of(datum) == [0.0, 1.0, 2.0]
 
-    def test_pad_rejects_wrong_length(self) -> None:
+    def test_rejects_wrong_length_weights(self) -> None:
         with pytest.raises(ValueError, match="do not pre-pad"):
-            pad_completion_values(make_trajectory(), [1.0, 2.0])
-
-    def test_slice_round_trips_padding(self) -> None:
-        traj = make_trajectory()
-        values = [1.0, 2.0, 3.0, 4.0, 5.0]
-        padded = torch.tensor(pad_completion_values(traj, values))
-        assert slice_completion_values(traj, padded).tolist() == values
-
-    def test_slice_rejects_wrong_length(self) -> None:
-        with pytest.raises(ValueError, match="alignment contract is broken"):
-            slice_completion_values(make_trajectory(), torch.zeros(3))
-
-    def test_slice_rejects_wrong_rank(self) -> None:
-        with pytest.raises(ValueError, match="alignment contract is broken"):
-            slice_completion_values(make_trajectory(), torch.zeros(2, 8))
+            build_datum(make_trajectory(), [1.0, 2.0])
 
 
 # ------------------------------------------------------------------- compute_logprobs
@@ -555,18 +520,60 @@ class TestSampling:
     async def test_logprobs_come_back_without_a_request_flag(self) -> None:
         backend, _ = make_backend()
         (response,) = await backend.sample([[1, 2, 3]], 2, SamplingParams(max_tokens=8))
-        assert all(seq.logprobs_np is not None for seq in response.sequences)
-        assert response.sequences[0].logprobs is not None
+        for seq in response.sequences:
+            assert seq.logprobs
+            assert len(seq.logprobs) == len(seq.tokens)
+
+    def test_missing_logprobs_are_an_error_not_a_zero_fill(self) -> None:
+        # Substituting zeros would tell the objective the behaviour policy assigned
+        # probability 1 to every token it emitted. The adapter is the boundary where a
+        # malformed API response has to be caught, because past it the neutral type
+        # cannot represent the problem.
+        malformed = SampledSequence(
+            stop_reason="stop", tokens_np=np.arange(3, dtype=np.int32), logprobs_np=None
+        )
+        with pytest.raises(ValueError, match="logprobs"):
+            from_tinker_sequence(malformed)
+
+    def test_an_empty_sequence_without_logprobs_is_tolerated(self) -> None:
+        # Nothing was sampled, so there is nothing to misrepresent; rollout drops it.
+        adapted = from_tinker_sequence(
+            SampledSequence(stop_reason="stop", tokens_np=None, logprobs_np=None)
+        )
+        assert adapted.tokens == []
+        assert adapted.logprobs == []
+
+    def test_adapter_carries_stop_reason_and_cache_hits(self) -> None:
+        response = SampleResponse(
+            sequences=[
+                SampledSequence(
+                    stop_reason="length",
+                    tokens_np=np.arange(2, dtype=np.int32),
+                    logprobs_np=np.full(2, -0.5, dtype=np.float32),
+                )
+            ],
+            prompt_cache_hit_tokens=11,
+        )
+        adapted = from_tinker_response(response)
+        assert adapted.prompt_cache_hit_tokens == 11
+        assert adapted.sequences[0].stop_reason == "length"
+        assert adapted.sequences[0].tokens == [0, 1]
+        assert adapted.sequences[0].logprobs == pytest.approx([-0.5, -0.5])
+
+    def test_empty_stop_list_reaches_the_sdk_as_none(self) -> None:
+        # The SDK distinguishes "no stop conditions" (None) from an empty list; the
+        # neutral type spells the former as an empty sequence.
+        assert to_tinker_sampling_params(SamplingParams(max_tokens=8)).stop is None
 
     async def test_empty_prompts_rejected(self) -> None:
         backend, _ = make_backend()
         with pytest.raises(ValueError, match="at least one prompt"):
-            await backend.sample([], 1, SamplingParams())
+            await backend.sample([], 1, SamplingParams(max_tokens=8))
 
     async def test_non_positive_num_samples_rejected(self) -> None:
         backend, _ = make_backend()
         with pytest.raises(ValueError, match="num_samples must be positive"):
-            await backend.sample([[1, 2]], 0, SamplingParams())
+            await backend.sample([[1, 2]], 0, SamplingParams(max_tokens=8))
 
     async def test_sync_sampler_swaps_in_fresh_weights(self) -> None:
         backend, training = make_backend()
@@ -574,7 +581,7 @@ class TestSampling:
         await backend.sync_sampler()
         assert training.sampler_saves == 1
         assert training.sampling_client is not before
-        await backend.sample([[1, 2]], 1, SamplingParams())
+        await backend.sample([[1, 2]], 1, SamplingParams(max_tokens=8))
         assert training.sampling_client.calls  # the NEW client received the request
 
 

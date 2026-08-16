@@ -1,15 +1,16 @@
 """Rollouts against a fake sampler: shape, ordering, and the two throughput properties.
 
 No network and no API key. The sampler is a stub returning canned
-:class:`~tinker.types.SampleResponse` objects, and the environment is either a recording
-stub or the *real* ``dataset: fixtures`` environment, which executes code in a subprocess
-and is the only way to prove the reward path is wired up end to end.
+:class:`~flowcode.types.SampleResponse` objects — the backend-neutral type, so this file
+never imports an engine SDK — and the environment is either a recording stub or the *real*
+``dataset: fixtures`` environment, which executes code in a subprocess and is the only way
+to prove the reward path is wired up end to end.
 
 Two non-obvious properties are asserted here because nothing else would catch them:
 
 * scoring runs on a worker thread, not the event loop — ``batch_log_reward`` blocks in
-  ``waitpid`` for the whole batch, and doing that inline stalls every other Tinker request
-  in flight;
+  ``waitpid`` for the whole batch, and doing that inline stalls every other request in
+  flight;
 * the segments of every produced trajectory tile the completion exactly, which
   :class:`~flowcode.types.Trajectory` enforces but only for the layout it is handed.
 """
@@ -20,15 +21,14 @@ import asyncio
 import threading
 from typing import Any, Literal
 
-import numpy as np
 import pytest
-from tinker.types import SampledSequence, SampleResponse, SamplingParams
 
 from flowcode.config import ModelConfig, RootConfig, TrainConfig
 from flowcode.envs.base import RewardResult, Task
 from flowcode.envs.code_exec import CodeExecEnv
 from flowcode.envs.datasets import load_fixture_tasks
 from flowcode.rollout import RolloutStats, rollout, solution_fingerprint
+from flowcode.types import SampledSequence, SampleResponse, SamplingParams
 
 CODE_BLOCK = "```python\ndef solve(x):\n    return x\n```"
 
@@ -73,13 +73,11 @@ class FakeSampler:
         completion_length: int = 4,
         empty_indices: tuple[int, ...] = (),
         stop_reason: Literal["length", "stop"] = "stop",
-        logprobs: bool = True,
         first_tokens: tuple[int, ...] | None = None,
     ) -> None:
         self.completion_length = completion_length
         self.empty_indices = empty_indices
         self.stop_reason = stop_reason
-        self.logprobs = logprobs
         self.first_tokens = first_tokens
         self.calls: list[tuple[list[list[int]], int, SamplingParams]] = []
 
@@ -97,17 +95,11 @@ class FakeSampler:
             for sample in range(num_samples):
                 length = 0 if index in self.empty_indices else self.completion_length
                 first = 100 + index if self.first_tokens is None else self.first_tokens[index]
-                tokens = np.array(
-                    [first + j for j in range(length)] if length else [], dtype=np.int32
-                )
-                logprobs = (
-                    np.full(length, -0.25 - 0.01 * sample, dtype=np.float32)
-                    if self.logprobs
-                    else None
-                )
                 sequences.append(
                     SampledSequence(
-                        stop_reason=self.stop_reason, tokens_np=tokens, logprobs_np=logprobs
+                        tokens=[first + j for j in range(length)],
+                        logprobs=[-0.25 - 0.01 * sample] * length,
+                        stop_reason=self.stop_reason,
                     )
                 )
                 index += 1
@@ -333,14 +325,6 @@ class TestDegenerateSamples:
             stats=stats,
         )
         assert stats.num_truncated == 4
-
-    async def test_missing_logprobs_are_an_error_not_a_zero_fill(self) -> None:
-        # Substituting zeros would tell the objective the behaviour policy assigned
-        # probability 1 to every token it emitted.
-        with pytest.raises(ValueError, match="logprobs"):
-            await rollout(
-                FakeSampler(logprobs=False), RecordingEnv(), FakeTokenizer(), TASKS, cfg()
-            )
 
     async def test_empty_task_list_is_rejected(self) -> None:
         with pytest.raises(ValueError, match="at least one task"):
