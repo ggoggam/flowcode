@@ -1,0 +1,6 @@
+# The hosted LoRA service. The policy lives on Tinker's servers and gradients reach it
+# through the cross-entropy bridge documented in docs/DESIGN.md.
+#
+# Nothing below `kind` applies here — they are all local-training knobs, kept at their
+# defaults so switching `backend=local` needs no other change.
+kind: tinker

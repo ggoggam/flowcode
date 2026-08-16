@@ -41,10 +41,13 @@ from omegaconf import MISSING
 __all__ = [
     "API_KEY_ENV_VAR",
     "PROJECT_ID_ENV_VAR",
+    "BackendConfig",
     "CostConfig",
     "ModelConfig",
+    "ProducerConfig",
     "ReplayConfig",
     "RootConfig",
+    "SamplerConfig",
     "TrainConfig",
     "get_api_key",
     "get_project_id",
@@ -96,6 +99,101 @@ class ReplayConfig:
 
 
 @dataclass
+class ProducerConfig:
+    """The decoupled sampler. Mirrors the ``producer`` block of ``conf/train/*.yaml``.
+
+    See :mod:`flowcode.producer` for why running the sampler ahead of the trainer is sound
+    for a GFlowNet and would not be for PPO.
+
+    Args:
+        enabled: Run sampling and scoring continuously in the background. When ``false``
+            the loop samples inside the step, as it always did.
+        concurrency: Workers sampling in parallel, each holding one group. Sequences in
+            flight is ``concurrency * group_size``, and the point of the whole exercise is
+            for that to be much larger than one step's worth.
+        queue_size: Bound on queued groups. Backpressure once full, which is what stops a
+            fast sampler running arbitrarily far ahead of a slow trainer.
+        max_staleness: Discard groups more than this many policy versions behind.
+            ``0`` keeps everything, which is the right default — the objectives do not
+            need the bound; it exists for ablations and for capping drift.
+    """
+
+    enabled: bool = False
+    concurrency: int = 8
+    queue_size: int = 32
+    max_staleness: int = 0
+
+
+@dataclass
+class BackendConfig:
+    """Where the policy lives. Mirrors ``conf/backend/*.yaml``.
+
+    Args:
+        kind: ``tinker`` for the hosted LoRA service, ``local`` for a model in this
+            process (see :mod:`flowcode.local_backend`).
+        micro_batch_size: Trajectories per forward pass, ``local`` only. Peak activation
+            memory scales with this rather than with the batch size.
+        dtype: Parameter dtype — ``bfloat16`` on anything modern.
+        mixed_precision: Passed to ``Accelerator``. ``null`` means no autocast, which is
+            right when the parameters are already bf16.
+        gradient_checkpointing: Trade compute for activation memory.
+        attn_implementation: ``flash_attention_2`` / ``sdpa`` / ``eager``; ``null`` lets
+            transformers choose.
+        weight_decay: AdamW weight decay on the LoRA parameters.
+        lora_alpha: LoRA scaling; ``null`` uses the usual ``2 * lora_rank``.
+        lora_dropout: Dropout on the LoRA path.
+        adapter_dir: Where sampler-sync adapters are written. On a remote sampler this
+            must be a path the engine's host can read too.
+        checkpoint_dir: Where run checkpoints go.
+    """
+
+    kind: str = "tinker"
+    micro_batch_size: int = 8
+    dtype: str = "bfloat16"
+    mixed_precision: str | None = None
+    gradient_checkpointing: bool = False
+    attn_implementation: str | None = None
+    weight_decay: float = 0.0
+    lora_alpha: int | None = None
+    lora_dropout: float = 0.0
+    adapter_dir: str = "adapters"
+    checkpoint_dir: str = "checkpoints"
+
+
+@dataclass
+class SamplerConfig:
+    """Where completions come from. Mirrors ``conf/sampler/*.yaml``.
+
+    Only consulted when ``backend.kind=local``; the hosted backend samples from the same
+    service it trains on.
+
+    Args:
+        mode: ``colocated`` shares devices with the trainer; ``remote`` reaches an engine
+            already running elsewhere over its OpenAI-compatible server.
+        base_url: Engine URL, ``remote`` only.
+        auth_token_env: Environment variable holding the server's bearer token, if it
+            needs one. Named for the *variable*, not the value: a composed config is dumped
+            verbatim into the run directory, and tests/test_config.py enforces that nothing
+            resembling a credential ever appears there.
+        gpu_memory_utilization: Fraction of device memory the colocated engine may claim.
+            Well below the single-tenant default because the trainer needs the rest.
+        max_model_len: Engine context window; ``null`` takes the model's own.
+        tensor_parallel_size: Devices to shard the colocated engine over.
+        enable_prefix_caching: Share prefills across requests.
+        max_lora_rank: Must be at least ``model.lora_rank``.
+    """
+
+    mode: str = "colocated"
+    base_url: str | None = None
+    auth_token_env: str | None = None
+    gpu_memory_utilization: float = 0.4
+    max_model_len: int | None = None
+    tensor_parallel_size: int = 1
+    enable_prefix_caching: bool = True
+    max_lora_rank: int = 32
+
+
+@dataclass
 class TrainConfig:
     """The training loop's shape. Mirrors ``conf/train/*.yaml``.
 
@@ -117,6 +215,7 @@ class TrainConfig:
         warmup_steps: Steps of linear warmup before the schedule proper.
         grad_clip_norm: Global grad-norm clip; ``0.0`` disables (Tinker's default).
         replay: Off-policy replay settings.
+        producer: Decoupled-sampler settings.
         on_policy_only: Reuse the sampler's own logprobs as the current-policy logprobs
             and skip the ``forward()`` oracle pass. Roughly halves the training-token
             bill; incompatible with replay.
@@ -138,6 +237,7 @@ class TrainConfig:
     warmup_steps: int = 10
     grad_clip_norm: float = 1.0
     replay: ReplayConfig = field(default_factory=ReplayConfig)
+    producer: ProducerConfig = field(default_factory=ProducerConfig)
     on_policy_only: bool = False
     sync_sampler_every: int = 1
     log_every: int = 1
@@ -194,6 +294,8 @@ class RootConfig:
         env: Selected ``env`` group, un-instantiated.
         train: Selected ``train`` group.
         cost: Selected ``cost`` group.
+        backend: Selected ``backend`` group — where the policy lives.
+        sampler: Selected ``sampler`` group — where completions come from.
     """
 
     seed: int = 0
@@ -207,6 +309,8 @@ class RootConfig:
     env: Any = MISSING
     train: TrainConfig = MISSING
     cost: CostConfig = MISSING
+    backend: BackendConfig = MISSING
+    sampler: SamplerConfig = MISSING
 
 
 def register_configs() -> None:
@@ -233,6 +337,8 @@ def register_configs() -> None:
     cs.store(group="model", name="_schema_", node=ModelConfig)
     cs.store(group="train", name="_schema_", node=TrainConfig)
     cs.store(group="cost", name="_schema_", node=CostConfig)
+    cs.store(group="backend", name="_schema_", node=BackendConfig)
+    cs.store(group="sampler", name="_schema_", node=SamplerConfig)
     cs.store(name="_root_", node=RootConfig)
 
 

@@ -114,7 +114,7 @@ class TestNoDriftBetweenYamlAndSchema:
         raw = OmegaConf.load(CONF_DIR / "config.yaml")
         assert isinstance(raw, DictConfig)
         own_keys = set(raw.keys()) - {"defaults"}
-        group_keys = {"model", "objective", "env", "train", "cost"}
+        group_keys = {"model", "objective", "env", "train", "cost", "backend", "sampler"}
         assert own_keys | group_keys == set(compose_cfg().keys())
 
     @pytest.mark.parametrize("name", MODEL_NAMES)

@@ -1,0 +1,24 @@
+# An engine in this process, sharing devices with the trainer. Runs on a single GPU or
+# chip, which is what makes it the right default for one accelerator.
+#
+# The binding constraint is memory: base model, LoRA, activations and KV cache all live on
+# the same device. If an 8B model will not fit alongside the trainer, that is the signal to
+# move to sampler=remote rather than to shrink the batch.
+mode: colocated
+
+# What the engine may claim for weights and KV cache. Well below the single-tenant default
+# because the trainer needs the rest. Raising it starves the trainer; lowering it starves
+# the KV cache and caps how many sequences can be in flight, which is the thing the
+# producer exists to raise.
+gpu_memory_utilization: 0.4
+
+# null takes the model's own context window.
+max_model_len: null
+tensor_parallel_size: 1
+
+# Share prefills across requests. A group already shares its prefill via n=group_size;
+# this additionally shares across the repeated sampling of the same task over a run.
+enable_prefix_caching: true
+
+# Must be at least model.lora_rank or the engine refuses the adapter.
+max_lora_rank: 32

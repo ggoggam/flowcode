@@ -16,6 +16,10 @@ defaults:
   - env: mbpp
   - train: default
   - cost: default
+  # Where the policy lives, and where completions come from. `sampler` is only consulted
+  # when backend=local; the hosted backend samples from the same service it trains on.
+  - backend: tinker
+  - sampler: colocated
   - _self_
 
 seed: 0

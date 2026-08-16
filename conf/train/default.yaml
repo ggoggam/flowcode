@@ -5,6 +5,19 @@ steps: 1000
 groups_per_step: 8
 group_size: 8
 
+# Decoupled sampling. Off by default so the shipped behaviour is unchanged; turn it on and
+# the sampler stops waiting for the trainer between steps. See flowcode.producer for why a
+# GFlowNet may train on stale trajectories where PPO may not.
+#
+# NOTE producer.concurrency * env.workers is the peak number of concurrent sandboxed
+# subprocesses. Raising concurrency without lowering env.workers is how a host ends up
+# with hundreds of forked interpreters running generated code.
+producer:
+  enabled: false
+  concurrency: 8
+  queue_size: 32
+  max_staleness: 0
+
 temperature: 1.0
 top_p: 1.0
 max_tokens: 512
