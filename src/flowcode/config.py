@@ -26,7 +26,7 @@ Secrets do not live in Hydra at all. A composed config is dumped verbatim into
 ``outputs/.../.hydra/config.yaml`` on every run, and an API key does not belong in a file
 that a sweep writes a hundred copies of. Use :func:`get_api_key` and
 :func:`get_project_id`, which read the process environment that ``mise`` has already
-populated from the workspace-root ``.env``.
+populated from the repo-root ``.env``.
 """
 
 from __future__ import annotations
@@ -247,11 +247,11 @@ PROJECT_ID_ENV_VAR = "TINKER_PROJECT_ID"
 
 _MISSING_KEY_MESSAGE = (
     f"{API_KEY_ENV_VAR} is not set, so flowcode cannot talk to Tinker.\n"
-    "The key lives in the WORKSPACE-ROOT .env (../.env relative to this project), which "
-    'mise loads via `_.file = "../.env"` in flowcode/mise.toml — not in flowcode/.env.\n'
+    'The key lives in .env at the repo root, which mise loads via `_.file = ".env"` in '
+    "mise.toml.\n"
     "Fix it with either of:\n"
-    f"  echo '{API_KEY_ENV_VAR}=tk-...' >> ../.env   # then cd out and back so mise reloads\n"
-    f"  export {API_KEY_ENV_VAR}=tk-...              # one-off, this shell only\n"
+    f"  echo '{API_KEY_ENV_VAR}=tk-...' >> .env   # then cd out and back so mise reloads\n"
+    f"  export {API_KEY_ENV_VAR}=tk-...           # one-off, this shell only\n"
     "See .env.example for the full list of variables flowcode reads."
 )
 
@@ -264,7 +264,7 @@ def get_api_key() -> str:
 
     Raises:
         RuntimeError: If the variable is unset or empty, with instructions naming the
-            workspace-root ``.env``.
+            repo-root ``.env``.
     """
     key = os.environ.get(API_KEY_ENV_VAR, "").strip()
     if not key:

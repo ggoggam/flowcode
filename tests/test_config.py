@@ -212,7 +212,7 @@ class TestSecretsBypassHydra:
         assert get_api_key() == "tk-test-123"
 
     @pytest.mark.parametrize("value", [None, "", "   "])
-    def test_missing_api_key_names_the_workspace_root_env(
+    def test_missing_api_key_names_the_env_file(
         self, monkeypatch: pytest.MonkeyPatch, value: str | None
     ) -> None:
         if value is None:
@@ -222,7 +222,7 @@ class TestSecretsBypassHydra:
         with pytest.raises(RuntimeError) as excinfo:
             get_api_key()
         message = str(excinfo.value)
-        assert "../.env" in message
+        assert ".env" in message
         assert API_KEY_ENV_VAR in message
 
     def test_project_id_is_optional(self, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -44,27 +44,28 @@ TV 0.79, so the thresholds are not vacuous.
 
 ## Local development
 
-Requires [mise](https://mise.jdx.dev). The Tinker credential is read from the **workspace-root**
-`.env` (`TINKER_API_KEY`), not this directory — see `.env.example`.
+Requires [mise](https://mise.jdx.dev). Copy `.env.example` to `.env` and set `TINKER_API_KEY`;
+mise loads it automatically. Nothing below the `test` line needs a key.
 
 ```sh
-mise install                 # uv
+mise install                 # uv, prek
 mise run sync                # resolve and install into .venv
 mise run test                # unit tests; no network, no API spend
 ```
 
-Tasks (monorepo-scoped as `//flowcode:<task>` from the repo root):
-
 | Task | What it does |
 |------|--------------|
-| `mise run //flowcode:sync` | `uv sync --all-extras --group dev` |
-| `mise run //flowcode:test` | pytest, excluding network- and API-marked tests |
-| `mise run //flowcode:test:all` | adds the dataset-loader tests that hit HuggingFace |
-| `mise run //flowcode:lint` | ruff check + `ty` type check |
-| `mise run //flowcode:fmt` | ruff format + safe autofixes |
-| `mise run //flowcode:cost` | price a config before spending anything |
-| `mise run //flowcode:train` | run a training job |
-| `mise run //flowcode:sweep` | Hydra `--multirun` sweep |
+| `mise run sync` | `uv sync --all-extras --group dev` |
+| `mise run test` | pytest, excluding network-, API- and slow-marked tests |
+| `mise run test:all` | adds the dataset-loader tests that hit HuggingFace |
+| `mise run test:slow` | the convergence suite only; minutes, no API spend |
+| `mise run lint` | ruff check + `ty` type check |
+| `mise run fmt` | ruff format + safe autofixes |
+| `mise run check` | lint + test |
+| `mise run pre-commit` | every hook in `.pre-commit-config.yaml`, via prek |
+| `mise run cost` | price a config before spending anything |
+| `mise run train` | run a training job |
+| `mise run sweep` | Hydra `--multirun` sweep |
 
 ## Running
 
