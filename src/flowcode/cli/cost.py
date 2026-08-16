@@ -70,6 +70,17 @@ def run(cfg: RootConfig, console: Console | None = None) -> None:
         "[dim]Sequence lengths are assumptions from conf/cost/*.yaml, not measurements. "
         "The training loop reports what a run actually spent at the end.[/dim]"
     )
+    if getattr(cfg.backend, "kind", "tinker") != "tinker":
+        # The price table prices Tinker's API. On your own hardware the token counts above
+        # are still the right throughput figures, but the dollars are not a bill anyone
+        # will send — and quietly leaving them on screen invites planning a run around a
+        # number that means nothing.
+        out.print(
+            f"[bold yellow]backend={cfg.backend.kind}: the dollar columns above do not "
+            "apply.[/bold yellow] They price Tinker's API; a local run's cost is device "
+            "time, which this estimator does not model. Read the token counts as "
+            "throughput and ignore the money."
+        )
 
 
 @hydra.main(version_base=None, config_path=CONFIG_PATH, config_name="config")
