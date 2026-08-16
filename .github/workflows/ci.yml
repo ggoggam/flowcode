@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pre-commit:
+    name: pre-commit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # Read the floor out of mise.toml and install exactly it, so there is one place to bump
+      # the version and CI cannot drift onto whatever mise-action's "latest" resolves to today.
+      - name: Resolve mise version from mise.toml
+        id: mise_version
+        run: |
+          v=$(sed -n 's/^min_version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' mise.toml)
+          test -n "$v" || { echo "::error::could not parse min_version from mise.toml"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      # mise-action's own cache is fine on GitHub-hosted runners, but it is keyed differently
+      # from the uv cache below and the two are cheaper to reason about when both are explicit.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.local/share/mise
+          key: mise-${{ runner.os }}-${{ hashFiles('mise.toml', 'mise.lock') }}
+          restore-keys: |
+            mise-${{ runner.os }}-
+
+      - uses: jdx/mise-action@v3
+        with:
+          version: ${{ steps.mise_version.outputs.version }}
+          cache: false
+
+      # prek's hook environments and uv's wheel cache. .venv is cached too because the local
+      # hooks shell out to `uv run`, which builds it on first use.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/prek
+            ~/.cache/uv
+            .venv
+          key: pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml', 'uv.lock') }}
+          restore-keys: |
+            pre-commit-${{ runner.os }}-
+
+      # No auto-commit of formatter output: this repo takes pull requests from forks, where the
+      # job has a read-only token and could not push the fix anyway. `--show-diff-on-failure`
+      # prints the exact patch to apply, and the job fails.
+      - name: Run pre-commit checks
+        run: mise run pre-commit
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve mise version from mise.toml
+        id: mise_version
+        run: |
+          v=$(sed -n 's/^min_version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' mise.toml)
+          test -n "$v" || { echo "::error::could not parse min_version from mise.toml"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.local/share/mise
+          key: mise-${{ runner.os }}-${{ hashFiles('mise.toml', 'mise.lock') }}
+          restore-keys: |
+            mise-${{ runner.os }}-
+
+      - uses: jdx/mise-action@v3
+        with:
+          version: ${{ steps.mise_version.outputs.version }}
+          cache: false
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: test-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            test-${{ runner.os }}-
+
+      # `uv run` (inside the task) builds .venv from the default dependency groups only — NOT
+      # `--all-extras`. That is deliberate: the `data` and `wandb` extras pull the HuggingFace
+      # and wandb stacks for code paths the default test selection never imports. It is also
+      # why the lint task passes `--exit-zero-on-warning`; see the comment on it in mise.toml.
+      #
+      # The suite deselects `network`, `tinker` and `slow` via addopts in pyproject.toml, so
+      # this job hits no network and spends no API credit. The slow convergence suite — the
+      # only thing proving the objectives are mathematically correct — runs in slow-tests.yml.
+      - name: Test
+        run: mise run test

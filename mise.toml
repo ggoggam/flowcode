@@ -1,20 +1,34 @@
-# flowcode project config (a monorepo config_root; registered in the workspace-root mise.toml).
-# uv lives here rather than the root [tools] set for the same reason go lives in hitch/mise.toml
-# and gcloud-cli-lite/mise.toml — project-specific toolchains stay with the project that needs
-# them, so a CI job installs only its own set.
+# Floor for local use AND the exact version CI installs: ci.yml and slow-tests.yml parse this
+# line and pass it to jdx/mise-action as `version:`, so there is one place to bump and CI runs
+# the declared floor rather than whatever the runner image happens to ship.
+min_version = "2026.8.5"
 
 [tools]
 # uv manages the interpreter itself (`.python-version` pins 3.12), so python is deliberately
 # NOT a mise tool here. Two installers owning the same runtime is how you get a venv built
 # against one interpreter and imported by another.
 uv = "latest"
+# Runs the hooks in .pre-commit-config.yaml (see the `pre-commit` task). This was inherited
+# from the monorepo root's shared [tools] table before flowcode was split out; it has to be
+# declared here now that nothing sits above this file.
+prek = "latest"
+
+[settings]
+# Pin exact tool versions (and per-platform URLs/checksums) in mise.lock, which is committed.
+# jdx/mise-action runs `mise install --locked` when a lock is present, and CI hashes the lock
+# into its tool-cache key. Refresh with:
+#   mise lock -p linux-x64,linux-x64-musl,linux-arm64,linux-arm64-musl,macos-arm64,macos-x64,windows-x64
+# Pass the whole platform list — a narrower `-p` writes only those and drops the rest of the
+# coverage. `--locked` hard-fails for a tool with no entry for the runner's platform, so the
+# lock has to stay complete.
+lockfile = true
 
 [env]
-# Tinker reads TINKER_API_KEY from the environment. The key lives in the *workspace-root*
-# .env, not this project's, so the same credential serves anything else that needs it — hence
-# the "../" here rather than the bare ".env" that hitch and slidekit use.
+# Tinker reads TINKER_API_KEY from the environment. In the monorepo this pointed at the
+# workspace-root .env ("../.env") so one credential served every project; standalone, the key
+# lives in this repo's own gitignored .env.
 # `_.file` is a no-op when the file is absent, so a fresh clone without a key still loads.
-_.file = "../.env"
+_.file = ".env"
 
 [tasks.sync]
 description = "Install the locked dependency set into .venv"
