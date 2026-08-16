@@ -28,6 +28,12 @@ run = "uv run pytest"
 description = "Run every test including the network-dependent dataset loaders (no Tinker spend)"
 run = "uv run pytest -m 'not tinker'"
 
+[tasks."test:slow"]
+description = "Run only the slow convergence suite (deselected from `test`; run nightly in CI)"
+# A -m on the command line replaces the one in addopts rather than adding to it, so this
+# selects the slow tests that `test` skips instead of intersecting with its exclusions.
+run = "uv run pytest -m slow"
+
 [tasks.lint]
 description = "Lint with ruff and type-check with ty"
 # --exit-zero-on-warning is what makes `unresolved-import = "warn"` in pyproject.toml mean

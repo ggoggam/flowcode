@@ -55,6 +55,13 @@ from flowcode.objectives.tb import TrajectoryBalance
 from flowcode.objectives.vargrad import VarGrad
 from flowcode.types import Trajectory, token_level_segments
 
+# Every test in this file trains to convergence, which is ~11s locally but ~456s on the CI
+# runner — 96% of the whole suite's wall clock. Deselected from the default `mise run test`
+# (see addopts in pyproject.toml) and run by the nightly slow-tests workflow instead, so a
+# regression here surfaces within a day rather than on the next PR. Run locally with
+# `mise run test:slow`.
+pytestmark = pytest.mark.slow
+
 VOCAB = 6
 LENGTH = 4
 NUM_TERMINALS = VOCAB**LENGTH  # 1296

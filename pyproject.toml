@@ -111,5 +111,9 @@ asyncio_mode = "auto"
 markers = [
   "network: requires internet access",
   "tinker: calls the live Tinker API and costs money",
+  # test_convergence.py only. Free and offline like the rest, but it trains to convergence:
+  # ~11s locally, ~456s on the CI runner, which was 96% of the suite's wall clock. The
+  # nightly slow-tests workflow runs it so the correctness proof still executes daily.
+  "slow: minutes-long convergence runs; deselected by default, run nightly",
 ]
-addopts = "-m 'not network and not tinker'"
+addopts = "-m 'not network and not tinker and not slow'"
