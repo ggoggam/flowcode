@@ -167,6 +167,14 @@ def test_cpu_and_core_limits_are_applied() -> None:
     assert "RLIMIT_CORE" in result.limits_applied
 
 
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason=(
+        "RLIMIT_NPROC is not enforced for root: copy_process() skips the check for INIT_USER "
+        "and for anything holding CAP_SYS_RESOURCE/CAP_SYS_ADMIN. The CI container runs as "
+        "root, where this limit buys nothing — see the rlimits caveat in sandbox.py."
+    ),
+)
 def test_process_limit_blocks_a_fork_bomb() -> None:
     code = (
         "import subprocess, sys\n"

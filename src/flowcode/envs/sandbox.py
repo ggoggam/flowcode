@@ -56,6 +56,18 @@ the wall-clock timeout as the only defence against a memory bomb (the OS will st
 swapping and the timeout will fire). Run the trainer on Linux if the memory limit
 matters.
 
+RUNNING AS ROOT
+---------------
+``RLIMIT_NPROC`` is silently ineffective for root. The kernel's ``copy_process()`` skips
+the check when the caller is ``INIT_USER`` or holds ``CAP_SYS_RESOURCE`` /
+``CAP_SYS_ADMIN``, so a uid-0 process can fork straight past whatever ``max_processes``
+says. Unlike the Darwin case above there is nothing to detect and report — the limit *is*
+applied, it just does not bind — so ``limits_applied`` will still list ``RLIMIT_NPROC``.
+This is not theoretical: it is exactly what the CI container does, which is why
+``test_process_limit_blocks_a_fork_bomb`` skips under uid 0. Run untrusted code as a
+non-root user if fork-bomb containment matters; as ever, the wall-clock timeout and the
+process-group kill are the backstop.
+
 ``preexec_fn`` is documented as unsafe in a multithreaded parent: it runs Python code
 between ``fork`` and ``exec``, where another thread may hold a lock that will never be
 released. :func:`run_python` is called from a thread pool by
