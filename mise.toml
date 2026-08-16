@@ -30,7 +30,13 @@ run = "uv run pytest -m 'not tinker'"
 
 [tasks.lint]
 description = "Lint with ruff and type-check with ty"
-run = ["uv run ruff check .", "uv run ty check src tests"]
+# --exit-zero-on-warning is what makes `unresolved-import = "warn"` in pyproject.toml mean
+# what it says: ty exits 1 on warning-level diagnostics by default, so downgrading the rule
+# kept the diagnostic readable but still failed the build. The two imports it fires on are
+# the lazy `datasets` and `wandb` ones, deliberately optional extras — CI syncs without them,
+# so they resolve locally (a venv built with --all-extras) and nowhere else, which is exactly
+# how this passed review and broke in CI. Error-level diagnostics still exit 1.
+run = ["uv run ruff check .", "uv run ty check --exit-zero-on-warning src tests"]
 
 [tasks.fmt]
 description = "Format Python code with ruff and apply safe lint fixes"
