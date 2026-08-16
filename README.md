@@ -1,9 +1,10 @@
 # flowcode
 
-GFlowNet fine-tuning of coding LLMs on the [Tinker](https://tinker-docs.thinkingmachines.ai)
-SDK. Trains a policy to sample solutions *in proportion to* how many tests they pass,
-`p(x) ∝ R(x)`, rather than to maximize the pass rate — the bet being that this finds more
-distinct working solutions per problem than reward-maximizing RL, which converges to one.
+GFlowNet fine-tuning of coding LLMs, on hosted [Tinker](https://tinker-docs.thinkingmachines.ai)
+or on your own GPUs/TPUs. Trains a policy to sample solutions *in proportion to* how many
+tests they pass, `p(x) ∝ R(x)`, rather than to maximize the pass rate — the bet being that
+this finds more distinct working solutions per problem than reward-maximizing RL, which
+converges to one.
 
 Tinker has no trajectory-balance loss and no way to ship one to the server. The whole thing
 rests on a bridge: `cross_entropy` computes `sum(-logprobs * weights)` with arbitrary-signed
@@ -16,6 +17,11 @@ Objectives are implemented and verified against exactly-computable toy distribut
 training loop runs end to end against the code-execution environment. **The hypothesis itself
 is untested** — nothing here has yet compared GFlowNet fine-tuning to a PPO baseline at equal
 spend.
+
+The local backend's gradient path is verified against single-pass autograd
+(`tests/test_local_backend.py`), and everything around the sampling engine is unit-tested.
+**Neither vLLM engine path has been run on real hardware yet**; `mise run test:hardware` is
+the gate for that.
 
 ## Objectives
 
@@ -34,10 +40,21 @@ TV 0.79, so the thresholds are not vacuous.
 
 ## Stack
 
-- **[Tinker](https://tinker-docs.thinkingmachines.ai)** — hosted LoRA training and sampling.
-  Default base model `Qwen/Qwen3-8B`: cheapest dense model on the platform that codes well.
-- **torch** — every objective is plain autograd, with no Tinker import anywhere in
-  `objectives/`, so the maths is unit-testable offline at zero API cost.
+Two backends behind one structural contract (`BackendLike` in `src/flowcode/train.py`), so
+the loop, the objectives and the environment are identical either way:
+
+| `backend=` | Policy lives | Sampling | Notes |
+|---|---|---|---|
+| `tinker` | Thinking Machines' servers | same service | The original path. Gradients reach it through the cross-entropy bridge in [docs/DESIGN.md](docs/DESIGN.md). |
+| `local` | this process | vLLM, `sampler.mode=colocated\|remote` | transformers + peft + accelerate. Runs on GPU or TPU. |
+
+- **torch** — every objective is plain autograd with no backend import anywhere in
+  `objectives/`, so the maths is unit-testable offline at zero cost. Neither backend
+  changed a line of it.
+- **[vLLM](https://docs.vllm.ai)** — continuous batching and paged KV for the local path,
+  with the same API on CUDA and TPU. `sampler.mode=colocated` shares devices with the
+  trainer; `remote` reaches an engine on another host and does not need vllm installed
+  locally at all.
 - **Hydra + OmegaConf** — structured configs, so a typo in an override fails at composition
   rather than ten minutes into a paid run. `--multirun` sweeps objectives directly.
 - **uv** — src-layout, absolute imports enforced by ruff (`TID252`).
@@ -55,10 +72,12 @@ mise run test                # unit tests; no network, no API spend
 
 | Task | What it does |
 |------|--------------|
-| `mise run sync` | `uv sync --all-extras --group dev` |
-| `mise run test` | pytest, excluding network-, API- and slow-marked tests |
+| `mise run sync` | every extra except `vllm`, which has no macOS wheel |
+| `mise run sync:vllm` | adds the engine; Linux + GPU/TPU only |
+| `mise run test` | pytest, excluding network-, API-, slow- and hardware-marked tests |
 | `mise run test:all` | adds the dataset-loader tests that hit HuggingFace |
 | `mise run test:slow` | the convergence suite only; minutes, no API spend |
+| `mise run test:hardware` | sampler/trainer logprob agreement; needs a real accelerator |
 | `mise run lint` | ruff check + `ty` type check |
 | `mise run fmt` | ruff format + safe autofixes |
 | `mise run check` | lint + test |
@@ -77,6 +96,41 @@ mise run train -- train=smoke env=fixtures       # ~$0.02, no dataset download, 
 mise run train -- objective=subtb env=mbpp       # a real run
 mise run sweep -- objective=tb,subtb,vargrad,db  # the actual experiment
 ```
+
+### On your own hardware
+
+`backend=local` puts the policy in this process. Nothing else about the run changes.
+
+```sh
+# One GPU or chip: engine and trainer share it.
+mise run train -- backend=local sampler=colocated env=mbpp
+
+# Engine on other devices, reached over its OpenAI-compatible server. The server needs
+# --enable-lora and VLLM_ALLOW_RUNTIME_LORA_UPDATING=1, and backend.adapter_dir has to be
+# readable from the server's host.
+mise run train -- backend=local sampler=remote sampler.base_url=http://10.0.0.4:8000
+```
+
+**Run `mise run test:hardware` once on new hardware before trusting a run.** It checks that
+the sampler and the trainer agree about what the policy is. When they do not,
+`on_policy_only` trains against logprobs the trainer never produced and importance weights
+are wrong — and nothing raises, nothing looks off in the metrics.
+
+Turn on the decoupled sampler to stop the accelerator idling between steps:
+
+```sh
+mise run train -- backend=local train.producer.enabled=true train.producer.concurrency=32
+```
+
+This trains on trajectories a few policy updates old, which the GFlowNet objectives permit
+by construction and PPO would not — see `src/flowcode/producer.py`. Watch
+`producer/waits`: near zero after warmup means the sampler is keeping up. Note that
+`producer.concurrency * env.workers` is the peak number of sandboxed subprocesses, so bring
+`env.workers` down as concurrency goes up.
+
+Checkpoints cover the policy, the flow parameters, the replay buffer and the step index
+together — TRC quota is preemptible, and a resume missing any of those is a different run
+wearing the same weights.
 
 `flowcode-cost` needs no API key and touches no network — it exists to answer "how much will
 this cost me" before you commit.

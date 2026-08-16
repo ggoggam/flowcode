@@ -10,6 +10,8 @@ from __future__ import annotations
 import pytest
 
 from flowcode.types import (
+    SampledSequence,
+    SamplingParams,
     Segment,
     TokenUsage,
     Trajectory,
@@ -184,3 +186,38 @@ class TestTokenUsage:
         # Tinker's cache-hit accounting is not multiplied across samples, so it can
         # exceed our gross count in odd cases; never report a negative bill.
         assert TokenUsage(sample_tokens=10, prompt_cache_hit_tokens=40).billable_sample_tokens == 0
+
+
+class TestSampledSequence:
+    def test_tokens_and_logprobs_must_agree_in_length(self) -> None:
+        # Substituting zeros for missing logprobs would tell the objective the behaviour
+        # policy assigned probability 1 to every token it emitted, so the invalid state is
+        # made unrepresentable rather than repaired downstream.
+        with pytest.raises(ValueError, match="one logprob per sampled token"):
+            SampledSequence(tokens=[1, 2, 3], logprobs=[-0.5, -0.25])
+
+    def test_empty_sequence_is_allowed(self) -> None:
+        # A sampler that returns nothing is degenerate, not malformed: rollout drops and
+        # counts it rather than ending a run over one bad sample.
+        assert SampledSequence(tokens=[], logprobs=[]).tokens == []
+
+    def test_stop_reason_defaults_to_unknown(self) -> None:
+        assert SampledSequence(tokens=[1], logprobs=[-0.5]).stop_reason == "unknown"
+
+
+class TestSamplingParams:
+    def test_max_tokens_must_be_positive(self) -> None:
+        with pytest.raises(ValueError, match="max_tokens must be positive"):
+            SamplingParams(max_tokens=0)
+
+    def test_greedy_decoding_is_allowed(self) -> None:
+        # The eval path passes temperature 0.0; it must not be mistaken for invalid.
+        assert SamplingParams(max_tokens=8, temperature=0.0).temperature == 0.0
+
+    def test_negative_temperature_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="temperature must be non-negative"):
+            SamplingParams(max_tokens=8, temperature=-1.0)
+
+    def test_top_p_outside_the_unit_interval_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match=r"top_p must be in \(0, 1\]"):
+            SamplingParams(max_tokens=8, top_p=0.0)

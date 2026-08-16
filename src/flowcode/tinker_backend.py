@@ -30,22 +30,10 @@ the flow parameters live.
 
 The alignment contract
 ----------------------
-Everything here depends on getting the off-by-one right, so it is asserted rather than
-hoped for. For a trajectory with prompt ``p`` (length ``P``) and completion ``c``
-(length ``N``)::
-
-    ob_len        = P - 1
-    model_input   = p + c[:-1]                    # length ob_len + N
-    target_tokens = [0] * ob_len + c              # length ob_len + N
-    weights       = [0.0] * ob_len + <N values>   # length ob_len + N
-
-The model predicts position ``i+1`` from position ``i``, so the logprob of ``c[0]`` shows
-up at index ``P - 1 = ob_len`` of the output, and the logprob of ``c[N-1]`` at index
-``ob_len + N - 1``. Positions ``[0, ob_len)`` score prompt tokens we do not train on; the
-zero weights there make them contribute nothing, and the padded ``0`` target tokens are
-never read for gradient purposes. :meth:`compute_logprobs` slices that padding off, so
-objectives only ever see arrays of length ``N`` indexed the same way
-``Trajectory.completion_tokens`` is.
+Which output position carries which completion token's logprob is not a Tinker question —
+every backend faces it — so it lives in :mod:`flowcode.alignment` and is merely *used*
+here. :func:`build_datum` asserts the three lengths agree on every single call rather than
+trusting them.
 
 Normalization
 -------------
@@ -63,22 +51,39 @@ import logging
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Protocol, TypeVar
 
+import numpy as np
 import tinker
 import torch
 from tinker import types as tinker_types
 
+from flowcode.alignment import (
+    build_input_tokens,
+    build_target_tokens,
+    pad_completion_values,
+    slice_completion_values,
+)
 from flowcode.config import ModelConfig
-from flowcode.types import TokenUsage, Trajectory, TrajectoryBatch
+from flowcode.types import (
+    SampledSequence,
+    SampleResponse,
+    SamplingParams,
+    TokenUsage,
+    Trajectory,
+    TrajectoryBatch,
+)
 
 if TYPE_CHECKING:
+    # Tinker's own wire types, aliased because this module now speaks two vocabularies:
+    # the SDK's on the client side and flowcode's neutral ones on the rollout side.
     from tinker.types import (
         Datum,
         ForwardBackwardOutput,
         ModelInput,
         OptimStepResponse,
-        SampleResponse,
-        SamplingParams,
     )
+    from tinker.types import SampledSequence as TinkerSampledSequence
+    from tinker.types import SampleResponse as TinkerSampleResponse
+    from tinker.types import SamplingParams as TinkerSamplingParams
 
 __all__ = [
     "LOSS_FN",
@@ -88,20 +93,15 @@ __all__ = [
     "TrainingClientLike",
     "build_datum",
     "build_model_input",
-    "build_target_tokens",
-    "observation_length",
-    "pad_completion_values",
-    "slice_completion_values",
+    "from_tinker_response",
+    "from_tinker_sequence",
+    "to_tinker_sampling_params",
 ]
 
 logger = logging.getLogger(__name__)
 
 LOSS_FN: tinker_types.LossFnType = "cross_entropy"
 """The only backend loss this module uses. See the module docstring for why that is enough."""
-
-_PAD_TARGET_TOKEN = 0
-"""Filler for the prompt-side target positions. Never contributes: its weight is 0.0."""
-
 
 # --------------------------------------------------------------------------------------
 # Structural types for the two Tinker clients.
@@ -162,8 +162,8 @@ class SamplingClientLike(Protocol):
         self,
         prompt: ModelInput,
         num_samples: int,
-        sampling_params: SamplingParams,
-    ) -> SampleResponse: ...
+        sampling_params: TinkerSamplingParams,
+    ) -> TinkerSampleResponse: ...
 
 
 # --------------------------------------------------------------------------------------
@@ -171,25 +171,8 @@ class SamplingClientLike(Protocol):
 # --------------------------------------------------------------------------------------
 
 
-def observation_length(trajectory: Trajectory) -> int:
-    """``ob_len``: how many leading output positions score prompt tokens, not completion.
-
-    Args:
-        trajectory: The trajectory to measure.
-
-    Returns:
-        ``len(prompt_tokens) - 1``. The model input is ``prompt + completion[:-1]``, and
-        position ``i`` predicts token ``i + 1``, so the first completion token's logprob
-        lands at index ``len(prompt_tokens) - 1``.
-    """
-    return trajectory.num_prompt_tokens - 1
-
-
 def build_model_input(trajectory: Trajectory) -> ModelInput:
-    """Build ``prompt + completion[:-1]`` as a Tinker :class:`ModelInput`.
-
-    The last completion token is deliberately absent: it is a *target* only. Including it
-    would ask the model to predict a token past the end of the trajectory.
+    """Wrap :func:`~flowcode.alignment.build_input_tokens` in a Tinker :class:`ModelInput`.
 
     Args:
         trajectory: The trajectory to encode.
@@ -197,79 +180,7 @@ def build_model_input(trajectory: Trajectory) -> ModelInput:
     Returns:
         A ``ModelInput`` of length ``ob_len + len(completion_tokens)``.
     """
-    prompt = tinker_types.ModelInput.from_ints(list(trajectory.prompt_tokens))
-    return prompt.append(
-        tinker_types.EncodedTextChunk(tokens=list(trajectory.completion_tokens[:-1]))
-    )
-
-
-def build_target_tokens(trajectory: Trajectory) -> list[int]:
-    """Build ``[0] * ob_len + completion_tokens``.
-
-    Args:
-        trajectory: The trajectory to encode.
-
-    Returns:
-        Target token ids aligned to :func:`build_model_input`'s output positions. The
-        leading zeros are filler for prompt-side positions and are inert because the
-        matching weights are zero.
-    """
-    ob_len = observation_length(trajectory)
-    return [_PAD_TARGET_TOKEN] * ob_len + list(trajectory.completion_tokens)
-
-
-def pad_completion_values(trajectory: Trajectory, values: Sequence[float]) -> list[float]:
-    """Left-pad a completion-shaped float array out to full model-input length.
-
-    This is the inverse of :func:`slice_completion_values` and the reason objectives never
-    have to think about the prompt at all.
-
-    Args:
-        trajectory: The trajectory the values belong to.
-        values: One float per completion token.
-
-    Returns:
-        ``[0.0] * ob_len + list(values)``.
-
-    Raises:
-        ValueError: If ``values`` is not exactly ``len(completion_tokens)`` long.
-    """
-    n = trajectory.num_completion_tokens
-    if len(values) != n:
-        raise ValueError(
-            f"Trajectory {trajectory.task_id!r}: expected {n} per-completion-token values "
-            f"(one per completion token) but got {len(values)}. Objectives work in "
-            "completion-token space; do not pre-pad."
-        )
-    return [0.0] * observation_length(trajectory) + [float(v) for v in values]
-
-
-def slice_completion_values(trajectory: Trajectory, full: torch.Tensor) -> torch.Tensor:
-    """Drop the prompt-side padding from a full-length per-position array.
-
-    Args:
-        trajectory: The trajectory the array belongs to.
-        full: A 1-D tensor of length ``ob_len + len(completion_tokens)``.
-
-    Returns:
-        A view of length ``len(completion_tokens)``, indexed like
-        ``Trajectory.completion_tokens``.
-
-    Raises:
-        ValueError: If ``full`` has the wrong rank or length, which in practice means the
-            alignment contract broke somewhere upstream.
-    """
-    ob_len = observation_length(trajectory)
-    expected = ob_len + trajectory.num_completion_tokens
-    if full.ndim != 1 or full.shape[0] != expected:
-        raise ValueError(
-            f"Trajectory {trajectory.task_id!r}: expected a 1-D array of length "
-            f"{expected} (= ob_len {ob_len} + {trajectory.num_completion_tokens} "
-            f"completion tokens) but got shape {tuple(full.shape)}. The server returned a "
-            "different number of positions than the model input had; the alignment "
-            "contract is broken."
-        )
-    return full[ob_len:]
+    return tinker_types.ModelInput.from_ints(build_input_tokens(trajectory))
 
 
 def build_datum(trajectory: Trajectory, weights: Sequence[float] | None = None) -> Datum:
@@ -334,6 +245,71 @@ def _extract_logprobs(output: ForwardBackwardOutput, index: int) -> torch.Tensor
     tensor_data = entry["logprobs"]
     values = torch.as_tensor(tensor_data.to_numpy(), dtype=torch.float32)
     return values.reshape(-1)
+
+
+def to_tinker_sampling_params(params: SamplingParams) -> tinker_types.SamplingParams:
+    """Adapt flowcode's neutral sampling params to the SDK's.
+
+    Args:
+        params: The neutral params a rollout built.
+
+    Returns:
+        The SDK equivalent. The fields correspond one-for-one, with one wrinkle: the SDK
+        spells "no stop conditions" as ``None`` and distinguishes it from an empty list,
+        so an empty neutral ``stop`` is passed through as ``None`` rather than ``[]``.
+    """
+    return tinker_types.SamplingParams(
+        max_tokens=params.max_tokens,
+        temperature=params.temperature,
+        top_p=params.top_p,
+        stop=list(params.stop) or None,
+        seed=params.seed,
+    )
+
+
+def from_tinker_sequence(sequence: TinkerSampledSequence) -> SampledSequence:
+    """Adapt one SDK sampled sequence to the neutral type.
+
+    Raises:
+        ValueError: If the sequence carries tokens but no logprobs. They arrive
+            unconditionally on the real API, so their absence means the response is not
+            what this code thinks it is — and silently substituting zeros would hand the
+            objective a behaviour policy that assigns probability 1 to everything.
+    """
+    tokens_np = sequence.tokens_np
+    logprobs_np = sequence.logprobs_np
+    tokens = [int(t) for t in (np.asarray(tokens_np).reshape(-1) if tokens_np is not None else [])]
+    if logprobs_np is None:
+        if not tokens:
+            return SampledSequence(tokens=[], logprobs=[], stop_reason="empty")
+        raise ValueError(
+            "the sampler returned tokens without logprobs; SampledSequence.logprobs_np is "
+            "populated unconditionally by the Tinker API, so this response is malformed"
+        )
+    logprobs = [float(v) for v in np.asarray(logprobs_np).reshape(-1)]
+    if len(logprobs) != len(tokens):
+        # Defensive: keep the pair aligned rather than letting SampledSequence reject it.
+        keep = min(len(tokens), len(logprobs))
+        logger.warning(
+            "sampler returned %d tokens but %d logprobs; truncating both to %d",
+            len(tokens),
+            len(logprobs),
+            keep,
+        )
+        tokens, logprobs = tokens[:keep], logprobs[:keep]
+    return SampledSequence(
+        tokens=tokens,
+        logprobs=logprobs,
+        stop_reason=str(getattr(sequence, "stop_reason", "unknown")),
+    )
+
+
+def from_tinker_response(response: TinkerSampleResponse) -> SampleResponse:
+    """Adapt one SDK sample response, and every sequence in it, to the neutral types."""
+    return SampleResponse(
+        sequences=[from_tinker_sequence(s) for s in response.sequences],
+        prompt_cache_hit_tokens=int(response.prompt_cache_hit_tokens),
+    )
 
 
 class TinkerBackend:
@@ -426,12 +402,13 @@ class TinkerBackend:
         Args:
             prompts: One token-id list per prompt. Order is preserved in the result.
             num_samples: Completions per prompt — the GFlowNet group size.
-            sampling_params: Temperature / top-p / max_tokens, built by the caller.
+            sampling_params: Neutral :class:`~flowcode.types.SamplingParams`, adapted to
+                the SDK's own type here so that callers never import ``tinker``.
 
         Returns:
-            One :class:`~tinker.types.SampleResponse` per prompt, in the same order.
-            Sampled-token logprobs arrive unconditionally on
-            ``response.sequences[i].logprobs_np``; there is no request flag to set.
+            One :class:`~flowcode.types.SampleResponse` per prompt, in the same order.
+            Sampled-token logprobs arrive unconditionally from the API; there is no
+            request flag to set.
 
         Raises:
             ValueError: If ``prompts`` is empty or ``num_samples`` is not positive.
@@ -442,6 +419,7 @@ class TinkerBackend:
             raise ValueError(f"num_samples must be positive, got {num_samples}")
 
         model_inputs = [tinker_types.ModelInput.from_ints(list(p)) for p in prompts]
+        params = to_tinker_sampling_params(sampling_params)
         # Deliberately not wrapped in asyncio.wait_for: the Tinker docs warn that
         # cancelling a request mid-flight leaves the session's clock cycle in a state the
         # client cannot recover from. Let it take as long as it takes.
@@ -450,21 +428,23 @@ class TinkerBackend:
                 self._sampling_client.sample_async(
                     prompt=model_input,
                     num_samples=num_samples,
-                    sampling_params=sampling_params,
+                    sampling_params=params,
                 )
                 for model_input in model_inputs
             )
         )
 
+        adapted = [from_tinker_response(r) for r in responses]
+
         gross_tokens = 0
         cache_hits = 0
-        for model_input, response in zip(model_inputs, responses, strict=True):
+        for model_input, response in zip(model_inputs, adapted, strict=True):
             gross_tokens += num_samples * model_input.length
             gross_tokens += sum(len(seq.tokens) for seq in response.sequences)
             cache_hits += response.prompt_cache_hit_tokens
         self._usage += TokenUsage(sample_tokens=gross_tokens, prompt_cache_hit_tokens=cache_hits)
 
-        return list(responses)
+        return adapted
 
     # ------------------------------------------------------------ the oracle pass
 

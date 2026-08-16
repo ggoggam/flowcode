@@ -29,6 +29,23 @@ dependencies = [
 # Dataset loaders. Kept optional so the unit tests (which use the bundled JSONL fixtures)
 # install and run without pulling in the HuggingFace stack.
 data = ["datasets>=3.2", "transformers>=4.48"]
+# Local training: the policy lives in this process instead of on a server.
+# `accelerate` rather than a Trainer-style framework because flowcode already owns its
+# loop and its backward is cotangent-driven (see flowcode.local_backend), so all that is
+# wanted from the stack is device placement, precision and distribution.
+local = [
+  "transformers>=4.48",
+  "peft>=0.14",
+  "accelerate>=1.3",
+  "safetensors>=0.4",
+  # For the *remote* sampler only, which talks to an engine on another host and therefore
+  # needs an HTTP client rather than an engine. Lives here, not under `vllm`, precisely so
+  # that remote sampling works on a machine that cannot install vllm at all.
+  "httpx>=0.27",
+]
+# In-process sampling. Deliberately NOT pulled in by `local`: vllm has no macOS wheel, so
+# a developer machine can install and test everything else without it.
+vllm = ["vllm>=0.7"]
 # Experiment tracking.
 wandb = ["wandb>=0.19"]
 
@@ -115,5 +132,9 @@ markers = [
   # ~11s locally, ~456s on the CI runner, which was 96% of the suite's wall clock. The
   # nightly slow-tests workflow runs it so the correctness proof still executes daily.
   "slow: minutes-long convergence runs; deselected by default, run nightly",
+  # Needs a real accelerator and the `vllm` extra, so it cannot run in CI or on a laptop.
+  # It is nonetheless the single most important correctness check in the local stack: see
+  # tests/test_logprob_agreement.py for what silently breaks when it is skipped forever.
+  "hardware: needs a GPU/TPU and a real vLLM engine; run manually before a real run",
 ]
-addopts = "-m 'not network and not tinker and not slow'"
+addopts = "-m 'not network and not tinker and not slow and not hardware'"

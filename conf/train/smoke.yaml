@@ -19,6 +19,14 @@ replay:
   fraction: 0.0
   prioritize: uniform
 
+# Off for a smoke run: the point is to prove the loop turns, and a background sampler
+# racing a five-step loop makes a failure harder to read, not easier.
+producer:
+  enabled: false
+  concurrency: 2
+  queue_size: 4
+  max_staleness: 0
+
 on_policy_only: true
 
 sync_sampler_every: 1

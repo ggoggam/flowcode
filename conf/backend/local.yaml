@@ -1,0 +1,30 @@
+# The policy in this process: transformers + peft for the LoRA, accelerate for device
+# placement and precision. See flowcode.local_backend.
+kind: local
+
+# Trajectories per forward pass. Peak activation memory scales with THIS, not with the
+# batch size — apply_gradient re-forwards in chunks rather than retaining a graph across
+# the whole batch. Lower it before lowering the batch if memory is tight.
+micro_batch_size: 8
+
+# bfloat16 everywhere modern. Note this should match the sampler's dtype: sampled logprobs
+# and recomputed ones are compared against each other, and a dtype mismatch shows up as
+# phantom importance weights rather than as an error.
+dtype: bfloat16
+# null means no autocast, which is what you want when the parameters are already bf16.
+mixed_precision: null
+
+# Trade compute for activation memory. Worth turning on for an 8B model on one device.
+gradient_checkpointing: false
+# flash_attention_2 | sdpa | eager. null lets transformers pick, which is usually right.
+attn_implementation: null
+
+weight_decay: 0.0
+# null uses the usual 2 * lora_rank.
+lora_alpha: null
+lora_dropout: 0.0
+
+# Adapters written on every sampler sync. With sampler.mode=remote this path is
+# interpreted by the ENGINE's host, so it has to be on storage both sides can see.
+adapter_dir: ${output_dir}/adapters
+checkpoint_dir: ${output_dir}/checkpoints

@@ -1,0 +1,25 @@
+# An engine already running elsewhere, reached over its OpenAI-compatible HTTP server.
+# Sampling and training never contend, which is the whole point.
+#
+# The server must have been started with --enable-lora and
+# VLLM_ALLOW_RUNTIME_LORA_UPDATING=1; without the latter the adapter-load endpoint is not
+# mounted and every sampler sync fails. backend.adapter_dir must be readable from the
+# SERVER's host, not just this one.
+#
+# This mode does not need vllm installed locally — only httpx, which the `local` extra
+# already pulls in.
+mode: remote
+
+base_url: http://127.0.0.1:8000
+
+# Environment variable holding the server's bearer token, if it needs one. The token
+# itself never enters the config: a composed config is dumped verbatim into the run
+# directory, and a sweep writes a hundred copies of it.
+auth_token_env: null
+
+# Colocated-only knobs, ignored here — the engine was configured when it was started.
+gpu_memory_utilization: 0.4
+max_model_len: null
+tensor_parallel_size: 1
+enable_prefix_caching: true
+max_lora_rank: 32

@@ -44,26 +44,41 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import random
 import re
 from collections.abc import Iterator, Sequence
+from pathlib import Path
 from typing import Any, Final, Protocol
 
 import torch
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 
+from flowcode.checkpoint import (
+    RunState,
+    load_run_state,
+    restore_flow_parameters,
+    save_run_state,
+)
 from flowcode.config import ModelConfig, RootConfig, get_api_key, get_project_id
 from flowcode.cost import CostEstimate, estimate, from_usage
 from flowcode.envs.base import Environment, Task
 from flowcode.envs.datasets import split_tasks
 from flowcode.logging import RunLogger, make_logger
 from flowcode.objectives.base import Objective
+from flowcode.producer import TrajectoryProducer
 from flowcode.render import ChatTokenizer
 from flowcode.replay import ReplayBuffer
 from flowcode.rollout import RolloutStats, rollout
 from flowcode.tinker_backend import TinkerBackend
-from flowcode.types import TokenUsage, Trajectory, TrajectoryBatch
+from flowcode.types import (
+    SampleResponse,
+    SamplingParams,
+    TokenUsage,
+    Trajectory,
+    TrajectoryBatch,
+)
 
 __all__ = [
     "EVAL_MAX_TASKS",
@@ -102,9 +117,12 @@ class BackendLike(Protocol):
     model_cfg: ModelConfig
 
     async def sample(
-        self, prompts: Sequence[Sequence[int]], num_samples: int, sampling_params: Any
-    ) -> Any:
-        """See :meth:`flowcode.tinker_backend.TinkerBackend.sample`."""
+        self,
+        prompts: Sequence[Sequence[int]],
+        num_samples: int,
+        sampling_params: SamplingParams,
+    ) -> list[SampleResponse]:
+        """See :meth:`flowcode.rollout.SamplerLike.sample`."""
         ...
 
     async def compute_logprobs(self, trajectories: TrajectoryBatch) -> list[torch.Tensor]:
@@ -278,6 +296,7 @@ class Trainer:
         train_tasks: Sequence[Task] | None = None,
         eval_tasks: Sequence[Task] | None = None,
         rng: random.Random | None = None,
+        producer: TrajectoryProducer | None = None,
     ) -> None:
         validate_train_config(cfg)
         self.cfg = cfg
@@ -312,6 +331,11 @@ class Trainer:
             torch.optim.Adam(params, lr=cfg.train.flow_lr) if params else None
         )
         self.flow_parameters: list[torch.nn.Parameter] = params
+
+        # When present, sampling and scoring run continuously in the background instead of
+        # inside the step. Its lifecycle belongs to run(); constructing a Trainer does not
+        # start it, so a caller driving step() by hand must start it themselves.
+        self.producer = producer
 
         self.step_index = 0
         self.last_metrics: dict[str, float] = {}
@@ -376,6 +400,32 @@ class Trainer:
             stats=stats,
         )
 
+    async def _collect_fresh(self, metrics: dict[str, float]) -> list[Trajectory]:
+        """This step's fresh trajectories, from the producer if there is one.
+
+        With a producer, sampling and scoring have been running continuously since the
+        run started and this only takes what is already finished — the step does not wait
+        on generation at all unless the sampler has fallen behind. Without one, the old
+        synchronous path runs: pick tasks, sample, score, all in series.
+
+        Args:
+            metrics: The step's metric dict, updated in place with whichever source's
+                statistics apply.
+
+        Returns:
+            The fresh trajectories, group-contiguous.
+        """
+        if self.producer is not None:
+            fresh = await self.producer.drain(self.cfg.train.groups_per_step)
+            metrics.update(self.producer.stats.as_metrics())
+            metrics["producer/queued_groups"] = float(self.producer.queued_groups)
+            return fresh
+
+        stats = RolloutStats()
+        fresh = await self.rollout_batch(self._pick_tasks(), stats)
+        metrics.update(stats.as_metrics())
+        return fresh
+
     def _mix_replay(self, fresh: Sequence[Trajectory]) -> tuple[list[Trajectory], int]:
         """Draw the replayed share of the batch, then bank the fresh rollouts.
 
@@ -426,10 +476,7 @@ class Trainer:
             await self.backend.sync_sampler()
             metrics["sampler_synced"] = 1.0
 
-        stats = RolloutStats()
-        tasks = self._pick_tasks()
-        fresh = await self.rollout_batch(tasks, stats)
-        metrics.update(stats.as_metrics())
+        fresh = await self._collect_fresh(metrics)
         if not fresh:
             # Every completion in the batch was degenerate. Nothing to train on, and
             # raising would throw away the whole run over one bad step.
@@ -592,13 +639,16 @@ class Trainer:
     # -------------------------------------------------------------------------- checkpoints
 
     async def save_checkpoint(self, step: int) -> str | None:
-        """Persist sampler weights via ``save_weights_for_sampler``.
+        """Persist everything needed to resume: policy, flow parameters, replay, position.
 
-        :class:`~flowcode.tinker_backend.TinkerBackend` keeps its Tinker clients private
-        and exposes no checkpoint API, so this reaches for the training client through a
-        documented attribute lookup and degrades to a warning when it is not there (which
-        is the case for the offline fakes). A failed checkpoint must not end a run that is
-        otherwise fine.
+        A backend that owns its model checkpoints itself and this additionally writes the
+        trainer's own state alongside it (see :mod:`flowcode.checkpoint` for why the flow
+        parameters and the replay buffer are not optional extras). The hosted backend has
+        no such API, so that path falls back to ``save_weights_for_sampler`` through a
+        documented attribute lookup and degrades to a warning when it is absent — which is
+        the case for the offline fakes.
+
+        A failed checkpoint must not end a run that is otherwise fine.
 
         Args:
             step: Step number, folded into the checkpoint name.
@@ -606,6 +656,9 @@ class Trainer:
         Returns:
             The saved path, or ``None`` if the backend cannot checkpoint.
         """
+        save_local = getattr(self.backend, "save_checkpoint", None)
+        if save_local is not None:
+            return self._save_local_checkpoint(save_local, step)
         client = getattr(self.backend, "_training_client", None)
         save = getattr(client, "save_weights_for_sampler_async", None)
         if save is None:
@@ -623,6 +676,79 @@ class Trainer:
         path = getattr(response, "path", None)
         return None if path is None else str(path)
 
+    def _save_local_checkpoint(self, save_local: Any, step: int) -> str | None:
+        """Write the backend's checkpoint plus the trainer's own state beside it."""
+        root = Path(getattr(self.cfg.backend, "checkpoint_dir", "checkpoints"))
+        target = root / f"step-{step:06d}"
+        try:
+            save_local(str(target))
+            save_run_state(
+                target,
+                RunState(
+                    step_index=self.step_index,
+                    policy_version=int(getattr(self.backend, "policy_version", 0)),
+                    flow_parameters=[p.detach().cpu() for p in self.flow_parameters],
+                    flow_optimizer=(
+                        self.flow_optimizer.state_dict()
+                        if self.flow_optimizer is not None
+                        else None
+                    ),
+                    replay=list(self.replay) if self.replay is not None else [],
+                    rng_state=self.rng.getstate(),
+                    torch_rng_state=torch.get_rng_state(),
+                    metadata={
+                        "objective": self.objective.name,
+                        "model": self.backend.model_cfg.name,
+                    },
+                ),
+            )
+        except Exception as exc:
+            logger.warning("checkpoint at step %d failed: %s", step, exc)
+            return None
+        return str(target)
+
+    def load_checkpoint(self, path: str) -> None:
+        """Resume from a checkpoint written by :meth:`save_checkpoint`.
+
+        Restores the policy through the backend and the flow parameters, replay buffer,
+        step index and RNG state through :mod:`flowcode.checkpoint`. Strict about all of
+        them: a resume that quietly restarts the LR schedule or reinitialises ``log Z``
+        looks like a working run and is not.
+
+        Args:
+            path: A checkpoint directory.
+
+        Raises:
+            FileNotFoundError: If the checkpoint is incomplete.
+            RuntimeError: If the backend cannot restore itself.
+            ValueError: If the flow parameters do not match the objective.
+        """
+        load_local = getattr(self.backend, "load_checkpoint", None)
+        if load_local is None:
+            raise RuntimeError(
+                f"backend {type(self.backend).__name__} cannot restore a checkpoint; only "
+                "backends that own their model can."
+            )
+        load_local(path)
+        state = load_run_state(path)
+        restore_flow_parameters(self.flow_parameters, state.flow_parameters)
+        if self.flow_optimizer is not None and state.flow_optimizer is not None:
+            self.flow_optimizer.load_state_dict(state.flow_optimizer)
+        if self.replay is not None:
+            self.replay.clear()
+            self.replay.add(state.replay)
+        self.step_index = state.step_index
+        if state.rng_state is not None:
+            self.rng.setstate(state.rng_state)
+        if state.torch_rng_state is not None:
+            torch.set_rng_state(state.torch_rng_state)
+        logger.info(
+            "resumed from %s at step %d with %d replayed trajectories",
+            path,
+            self.step_index,
+            len(state.replay),
+        )
+
     # -------------------------------------------------------------------------- the run
 
     async def run(self) -> dict[str, float]:
@@ -639,6 +765,14 @@ class Trainer:
             f"tasks={len(self.train_tasks)} eval_tasks={len(self.eval_tasks)}"
         )
         self.run_logger.log_object(budget.render(title="estimated cost of this run"))
+
+        if self.producer is not None:
+            await self.producer.start()
+            # Warm up before the first step so it does not block on an empty queue. Not
+            # fatal if the timeout fires — drain() waits for one group either way; this
+            # only keeps the first step from being an outlier in the metrics.
+            queued = await self.producer.prefill(cfg.train.groups_per_step, timeout=600.0)
+            self.run_logger.log_text(f"producer warmed up with {queued} group(s) queued")
 
         try:
             for _ in range(cfg.train.steps):
@@ -661,6 +795,8 @@ class Trainer:
                     self.run_logger.log(step, metrics)
                 self.last_metrics = metrics
         finally:
+            if self.producer is not None:
+                await self.producer.stop()
             self._report_cost(budget)
             self.run_logger.close()
         return self.last_metrics
@@ -738,7 +874,7 @@ async def train(cfg: RootConfig) -> None:
     # unregistered id would grow the table mid-run and invalidate the flow optimiser.
     objective.register_tasks(list(_iter_task_ids(tasks)))
 
-    backend = await TinkerBackend.create(cfg.model, get_api_key(), get_project_id())
+    backend = await _build_backend(cfg)
     tokenizer = _tokenizer_of(backend)
     run_logger = make_logger(cfg.logger, config=_config_dict(cfg), name=f"{objective.name}")
 
@@ -750,21 +886,104 @@ async def train(cfg: RootConfig) -> None:
         tokenizer,
         run_logger=run_logger,
     )
+    if cfg.train.producer.enabled:
+        trainer.producer = TrajectoryProducer(
+            backend,
+            env,
+            tokenizer,
+            cfg,
+            trainer.train_tasks,
+            concurrency=cfg.train.producer.concurrency,
+            queue_size=cfg.train.producer.queue_size,
+            max_staleness=cfg.train.producer.max_staleness,
+            rng=random.Random(cfg.seed + 1),
+            env_workers=int(getattr(cfg.env, "workers", 8)),
+        )
     await trainer.run()
 
 
-def _tokenizer_of(backend: object) -> ChatTokenizer:
-    """Fetch the model's tokenizer from the backend's training client.
+async def _build_backend(cfg: RootConfig) -> BackendLike:
+    """Construct the backend named by ``backend.kind``.
 
-    ``TinkerBackend`` deliberately keeps its clients private and offers no tokenizer
-    accessor, and it is not this module's file to change. The attribute lookup is the
-    compromise; it is asserted here rather than left to fail inside the first rollout.
-    Typed ``object`` for the same reason: the access is structural either way, and this
-    keeps the offline fakes usable without a cast.
+    Imported lazily in both branches: the hosted path needs ``tinker`` and an API key, the
+    local path needs the ``local`` extra, and asking for one must not require the other.
+
+    Args:
+        cfg: The composed run config.
+
+    Returns:
+        A backend satisfying :class:`BackendLike`.
 
     Raises:
-        RuntimeError: If the client cannot produce a tokenizer.
+        ValueError: On an unknown ``backend.kind``.
     """
+    kind = getattr(cfg.backend, "kind", "tinker")
+    if kind == "tinker":
+        return await TinkerBackend.create(cfg.model, get_api_key(), get_project_id())
+    if kind == "local":
+        from flowcode.local_backend import LocalBackend
+        from flowcode.samplers import build_sampler
+
+        sampler = build_sampler(
+            cfg.sampler.mode,
+            cfg.model.name,
+            **_sampler_kwargs(cfg),
+        )
+        return LocalBackend.create(
+            cfg.model,
+            sampler=sampler,
+            dtype=cfg.backend.dtype,
+            lora_alpha=cfg.backend.lora_alpha,
+            lora_dropout=cfg.backend.lora_dropout,
+            micro_batch_size=cfg.backend.micro_batch_size,
+            learning_rate=cfg.train.policy_lr,
+            weight_decay=cfg.backend.weight_decay,
+            gradient_checkpointing=cfg.backend.gradient_checkpointing,
+            attn_implementation=cfg.backend.attn_implementation,
+            adapter_dir=cfg.backend.adapter_dir,
+            mixed_precision=cfg.backend.mixed_precision,
+        )
+    raise ValueError(f"backend.kind must be 'tinker' or 'local', got {kind!r}")
+
+
+def _sampler_kwargs(cfg: RootConfig) -> dict[str, Any]:
+    """The subset of ``sampler.*`` that applies to the selected mode.
+
+    The two modes take disjoint knobs — a remote engine was configured when it was
+    started — so passing everything through would make ``create`` reject valid configs.
+    """
+    if cfg.sampler.mode == "remote":
+        token_env = cfg.sampler.auth_token_env
+        return {
+            "base_url": cfg.sampler.base_url,
+            "api_key": os.environ.get(token_env) if token_env else None,
+        }
+    return {
+        "max_lora_rank": max(cfg.sampler.max_lora_rank, cfg.model.lora_rank),
+        "gpu_memory_utilization": cfg.sampler.gpu_memory_utilization,
+        "max_model_len": cfg.sampler.max_model_len,
+        "enable_prefix_caching": cfg.sampler.enable_prefix_caching,
+        "tensor_parallel_size": cfg.sampler.tensor_parallel_size,
+        "dtype": cfg.backend.dtype,
+        "seed": cfg.seed,
+    }
+
+
+def _tokenizer_of(backend: object) -> ChatTokenizer:
+    """Fetch the model's tokenizer from the backend.
+
+    A backend that owns its model exposes a ``tokenizer`` property and is asked directly.
+    ``TinkerBackend`` does not — it keeps its clients private and offers no tokenizer
+    accessor — so the hosted path falls back to reaching through the training client. That
+    lookup is asserted here rather than left to fail inside the first rollout. Typed
+    ``object`` so the offline fakes stay usable without a cast.
+
+    Raises:
+        RuntimeError: If neither route produces a tokenizer.
+    """
+    own = getattr(backend, "tokenizer", None)
+    if own is not None:
+        return own  # ty: ignore[invalid-return-type]
     client = getattr(backend, "_training_client", None)
     get_tokenizer = getattr(client, "get_tokenizer", None)
     if get_tokenizer is None:

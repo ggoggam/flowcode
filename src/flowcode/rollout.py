@@ -12,10 +12,9 @@ and with it every other in-flight Tinker request. :func:`asyncio.to_thread` hand
 batch to a worker thread, where the environment's own :class:`ThreadPoolExecutor` fans it
 out. The GIL is not a factor: the workers are blocked in the kernel the entire time.
 
-**Sampling is one call, not one per prompt.**
-:meth:`flowcode.tinker_backend.TinkerBackend.sample` already gathers concurrently over
-prompts, so a per-prompt loop here would serialise what the backend deliberately
-parallelised.
+**Sampling is one call, not one per prompt.** Every backend's ``sample`` already fans out
+over prompts internally, so a per-prompt loop here would serialise what the backend
+deliberately parallelised.
 
 Segments
 --------
@@ -45,14 +44,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-import numpy as np
-from tinker import types as tinker_types
-
 from flowcode.config import RootConfig
 from flowcode.envs.base import RewardResult, Task
 from flowcode.envs.extract import extract_code
 from flowcode.render import ChatTokenizer, completion_to_text, render_prompt, stop_sequences
-from flowcode.types import Trajectory, token_level_segments
+from flowcode.types import SampleResponse, SamplingParams, Trajectory, token_level_segments
 
 __all__ = ["RolloutStats", "SamplerLike", "ScorerLike", "rollout", "solution_fingerprint"]
 
@@ -60,14 +56,20 @@ logger = logging.getLogger(__name__)
 
 
 class SamplerLike(Protocol):
-    """The part of :class:`~flowcode.tinker_backend.TinkerBackend` a rollout uses."""
+    """The part of a backend a rollout uses.
+
+    Deliberately stated in terms of :class:`~flowcode.types.SampleResponse` rather than any
+    engine's own response type: a rollout is identical whether the completions came from a
+    hosted API or from a local engine, and the only way to keep it that way is for the
+    adaptation to happen at the backend's edge instead of here.
+    """
 
     async def sample(
         self,
         prompts: Sequence[Sequence[int]],
         num_samples: int,
-        sampling_params: tinker_types.SamplingParams,
-    ) -> list[tinker_types.SampleResponse]:
+        sampling_params: SamplingParams,
+    ) -> list[SampleResponse]:
         """Draw ``num_samples`` completions per prompt, in prompt order."""
         ...
 
@@ -92,7 +94,7 @@ class RolloutStats:
             high rate means the completion budget is clipping real answers, which shows up
             as an unexplained pile of syntax errors in the reward.
         completion_tokens: Total sampled tokens kept.
-        prompt_cache_hit_tokens: Prompt tokens Tinker served from its prefix cache.
+        prompt_cache_hit_tokens: Prompt tokens the sampler served from its prefix cache.
     """
 
     num_requested: int = 0
@@ -148,39 +150,6 @@ def solution_fingerprint(completion_text: str) -> str:
     return hashlib.sha256(normalised.encode("utf-8")).hexdigest()[:16]
 
 
-def _sequence_arrays(sequence: tinker_types.SampledSequence) -> tuple[list[int], list[float]]:
-    """Pull ``(tokens, logprobs)`` off a sampled sequence, trimmed to a common length.
-
-    Raises:
-        ValueError: If the sampler returned no logprobs. They arrive unconditionally on the
-            real API, so their absence means the response is not what this code thinks it
-            is — and silently substituting zeros would hand the objective a behaviour
-            policy that assigns probability 1 to everything.
-    """
-    tokens_np = sequence.tokens_np
-    logprobs_np = sequence.logprobs_np
-    tokens = [int(t) for t in (np.asarray(tokens_np).reshape(-1) if tokens_np is not None else [])]
-    if logprobs_np is None:
-        if not tokens:
-            return [], []
-        raise ValueError(
-            "the sampler returned tokens without logprobs; SampledSequence.logprobs_np is "
-            "populated unconditionally by the Tinker API, so this response is malformed"
-        )
-    logprobs = [float(v) for v in np.asarray(logprobs_np).reshape(-1)]
-    if len(logprobs) != len(tokens):
-        # Defensive: keep the pair aligned rather than letting Trajectory reject the batch.
-        keep = min(len(tokens), len(logprobs))
-        logger.warning(
-            "sampler returned %d tokens but %d logprobs; truncating both to %d",
-            len(tokens),
-            len(logprobs),
-            keep,
-        )
-        tokens, logprobs = tokens[:keep], logprobs[:keep]
-    return tokens, logprobs
-
-
 def _build_sampling_params(
     cfg: RootConfig,
     tokenizer: ChatTokenizer,
@@ -189,9 +158,9 @@ def _build_sampling_params(
     temperature: float,
     top_p: float,
     seed: int | None,
-) -> tinker_types.SamplingParams:
-    """Assemble ``SamplingParams``, including the renderer's stop conditions."""
-    return tinker_types.SamplingParams(
+) -> SamplingParams:
+    """Assemble :class:`~flowcode.types.SamplingParams`, with the renderer's stop conditions."""
+    return SamplingParams(
         max_tokens=max_tokens,
         temperature=temperature,
         top_p=top_p,
@@ -217,8 +186,7 @@ async def rollout(
     """Sample completions for ``tasks`` and score them into trajectories.
 
     Args:
-        backend: Anything with :meth:`SamplerLike.sample` — the real
-            :class:`~flowcode.tinker_backend.TinkerBackend` in production.
+        backend: Anything with :meth:`SamplerLike.sample`.
         env: The scoring environment.
         tokenizer: The model's tokenizer, for rendering and decoding.
         tasks: Prompts to condition on. One group per task.
@@ -230,7 +198,7 @@ async def rollout(
             greedy decoding.
         top_p: Overrides ``cfg.train.top_p``.
         max_tokens: Overrides ``cfg.train.max_tokens``.
-        seed: Sampler seed, forwarded to Tinker. ``None`` leaves it unseeded.
+        seed: Sampler seed, forwarded to the backend. ``None`` leaves it unseeded.
         stats: Optional :class:`RolloutStats` to accumulate into; a fresh one is used when
             omitted.
 
@@ -274,8 +242,8 @@ async def rollout(
         tracker.prompt_cache_hit_tokens += int(response.prompt_cache_hit_tokens)
         for sequence in response.sequences:
             tracker.num_returned += 1
-            tokens, logprobs = _sequence_arrays(sequence)
-            stop_reason = str(getattr(sequence, "stop_reason", "unknown"))
+            tokens, logprobs = sequence.tokens, sequence.logprobs
+            stop_reason = sequence.stop_reason
             if not tokens:
                 # Nothing was sampled: unscoreable and unrepresentable. Drop it.
                 tracker.num_empty += 1
@@ -287,8 +255,8 @@ async def rollout(
                 _Candidate(
                     task=task,
                     prompt_tokens=list(prompt_tokens),
-                    completion_tokens=tokens,
-                    sampling_logprobs=logprobs,
+                    completion_tokens=list(tokens),
+                    sampling_logprobs=list(logprobs),
                     stop_reason=stop_reason,
                     text=completion_to_text(tokenizer, tokens, renderer),
                 )

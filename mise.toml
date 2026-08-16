@@ -32,7 +32,21 @@ _.file = ".env"
 
 [tasks.sync]
 description = "Install the locked dependency set into .venv"
+# Every extra except `vllm`, which has no macOS wheel and would make this task fail on a
+# developer machine. The training backend is fully testable without it; `sync:vllm` below
+# adds it on a box that can actually run an engine.
+run = "uv sync --extra data --extra local --extra wandb --group dev"
+
+[tasks."sync:vllm"]
+description = "Install the sampling engine as well (Linux + GPU/TPU only)"
 run = "uv sync --all-extras --group dev"
+
+[tasks."test:hardware"]
+description = "Sampler/trainer logprob agreement — needs a GPU or TPU and `sync:vllm`"
+# Deselected everywhere else, so without running this by hand it never runs at all. It is
+# the check that catches a sampler and a trainer disagreeing about what the policy is,
+# which is silent in every metric. Run it once on new hardware before a real run.
+run = "uv run pytest -m hardware"
 
 [tasks.test]
 description = "Run the unit tests (skips network- and Tinker-marked tests)"

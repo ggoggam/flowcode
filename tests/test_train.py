@@ -26,11 +26,9 @@ import random
 import sys
 from typing import Any, cast
 
-import numpy as np
 import pytest
 import torch
 from rich.console import Console
-from tinker.types import SampledSequence, SampleResponse, SamplingParams
 
 from flowcode.config import CostConfig, ModelConfig, ReplayConfig, RootConfig, TrainConfig
 from flowcode.envs.base import RewardResult, Task
@@ -46,7 +44,7 @@ from flowcode.train import (
     learning_rate,
     validate_train_config,
 )
-from flowcode.types import TokenUsage
+from flowcode.types import SampledSequence, SampleResponse, SamplingParams, TokenUsage
 
 MODEL_CFG = ModelConfig(name="Qwen/Qwen3-8B", renderer="qwen3")
 
@@ -139,12 +137,11 @@ class FakeBackend:
         for _prompt in prompts:
             sequences = []
             for _ in range(num_samples):
-                tokens = np.arange(token, token + self.completion_length, dtype=np.int32)
                 sequences.append(
                     SampledSequence(
+                        tokens=list(range(token, token + self.completion_length)),
+                        logprobs=[-0.3] * self.completion_length,
                         stop_reason="stop",
-                        tokens_np=tokens,
-                        logprobs_np=np.full(self.completion_length, -0.3, dtype=np.float32),
                     )
                 )
                 token += 1
@@ -459,11 +456,7 @@ class TestOneStep:
                 return [
                     SampleResponse(
                         sequences=[
-                            SampledSequence(
-                                stop_reason="stop",
-                                tokens_np=np.array([], dtype=np.int32),
-                                logprobs_np=np.array([], dtype=np.float32),
-                            )
+                            SampledSequence(tokens=[], logprobs=[], stop_reason="stop")
                             for _ in range(num_samples)
                         ],
                         prompt_cache_hit_tokens=0,
